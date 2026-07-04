@@ -14,23 +14,21 @@
   //
   // To preserve 100% of the original functionality (device-support patches:
   // SetUserAgent/GetArchitecture/GetBrandAndModel via h5vcc_tizentube, i18n,
-  // etc.) we synchronously fetch and eval the REAL upstream userScript.js
-  // first, exactly mirroring the original native fetch+eval timing, and only
-  // THEN add the Yandex VOT translation overlay on top.
+  // etc.) we load the REAL upstream userScript.js via a normal <script src>
+  // element (NOT eval/XHR+eval: the page enforces Trusted Types, which
+  // blocks eval() of fetched text with "requires 'TrustedScript' assignment").
+  // A <script src="..."> element is not subject to that eval/text sink and
+  // mirrors exactly what the native fetch+inject mechanism itself does.
   var ORIGINAL_USERSCRIPT_URL =
     'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
     Date.now() + '.' + Math.floor(Math.random() * 1e6);
 
   (function loadOriginalUserScript() {
     try {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', ORIGINAL_USERSCRIPT_URL, false); // synchronous, matches original timing
-      xhr.send(null);
-      if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) {
-        (0, eval)(xhr.responseText);
-      } else {
-        console.warn('[VOT] original userScript fetch failed, status=' + xhr.status);
-      }
+      var s = document.createElement('script');
+      s.src = ORIGINAL_USERSCRIPT_URL;
+      s.async = false;
+      (document.head || document.documentElement).appendChild(s);
     } catch (e) {
       console.warn('[VOT] failed to load original userScript', e);
     }
@@ -313,6 +311,31 @@
     S.translationId = null;
   }
 
+  // CSP forbids setAttribute('style', ...) / style.cssText assignment
+  // (style-src requires a nonce we don't have), but individual
+  // CSSStyleDeclaration longhand property assignment (el.style.prop = val)
+  // is NOT gated by CSP style-src, so we apply styles that way instead.
+  function applyStyle(el, decl) {
+    for (var prop in decl) {
+      if (Object.prototype.hasOwnProperty.call(decl, prop)) {
+        el.style[prop] = decl[prop];
+      }
+    }
+  }
+
+  var BTN_STYLE_OFF = {
+    padding: '10px 20px', fontSize: '17px', fontWeight: 'bold',
+    background: 'rgba(0,0,0,0.85)', color: '#fff',
+    border: '2px solid #f90', borderRadius: '10px',
+    cursor: 'pointer', outline: 'none'
+  };
+  var BTN_STYLE_ON = {
+    padding: '10px 20px', fontSize: '17px', fontWeight: 'bold',
+    background: 'rgba(0,0,0,0.85)', color: '#fff',
+    border: '2px solid #0f0', borderRadius: '10px',
+    cursor: 'pointer', outline: 'none'
+  };
+
   // UI
   function buildUI() {
     if (document.getElementById('vot-btn')) return;
@@ -320,45 +343,33 @@
 
     var wrap = document.createElement('div');
     wrap.id = 'vot-wrap';
-    wrap.setAttribute('style',
-      'position:fixed;bottom:70px;right:16px;z-index:99999;' +
-      'display:flex;flex-direction:column;align-items:flex-end;gap:6px;'
-    );
+    applyStyle(wrap, {
+      position: 'fixed', bottom: '70px', right: '16px', zIndex: '99999',
+      display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px'
+    });
 
     var status = document.createElement('div');
     status.id = 'vot-status';
-    status.setAttribute('style',
-      'font-size:14px;color:#fff;background:rgba(0,0,0,0.75);' +
-      'padding:4px 12px;border-radius:6px;display:none;'
-    );
+    applyStyle(status, {
+      fontSize: '14px', color: '#fff', background: 'rgba(0,0,0,0.75)',
+      padding: '4px 12px', borderRadius: '6px', display: 'none'
+    });
 
     var btn = document.createElement('button');
     btn.id = 'vot-btn';
     btn.textContent = 'Перевод ВЫКЛ';
-    btn.setAttribute('style',
-      'padding:10px 20px;font-size:17px;font-weight:bold;' +
-      'background:rgba(0,0,0,0.85);color:#fff;' +
-      'border:2px solid #f90;border-radius:10px;cursor:pointer;outline:none;'
-    );
+    applyStyle(btn, BTN_STYLE_OFF);
 
     btn.addEventListener('click', function() {
       S.on = !S.on;
       if (S.on) {
         btn.textContent = 'Перевод ВКЛ';
-        btn.setAttribute('style',
-          'padding:10px 20px;font-size:17px;font-weight:bold;' +
-          'background:rgba(0,0,0,0.85);color:#fff;' +
-          'border:2px solid #0f0;border-radius:10px;cursor:pointer;outline:none;'
-        );
+        applyStyle(btn, BTN_STYLE_ON);
         status.style.display = 'block';
         startVOT();
       } else {
         btn.textContent = 'Перевод ВЫКЛ';
-        btn.setAttribute('style',
-          'padding:10px 20px;font-size:17px;font-weight:bold;' +
-          'background:rgba(0,0,0,0.85);color:#fff;' +
-          'border:2px solid #f90;border-radius:10px;cursor:pointer;outline:none;'
-        );
+        applyStyle(btn, BTN_STYLE_OFF);
         status.style.display = 'none';
         stopVOT();
       }
