@@ -23,10 +23,39 @@
     'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
     Date.now() + '.' + Math.floor(Math.random() * 1e6);
 
+  // Cobalt/Starboard's WebView enforces Trusted Types (require-trusted-types-for
+  // 'script'), which blocks assigning a plain string to sinks like
+  // HTMLScriptElement.src/text UNLESS a Trusted Types policy has produced the
+  // value. Register a permissive pass-through 'default' policy (if one doesn't
+  // already exist) so plain-string assignment keeps working transparently,
+  // exactly like the native fetch+inject path already does.
+  var ttPolicy = null;
+  if (typeof window !== 'undefined' && window.trustedTypes && trustedTypes.createPolicy) {
+    try {
+      ttPolicy = trustedTypes.createPolicy('default', {
+        createScriptURL: function(u) { return u; },
+        createScript: function(s) { return s; },
+        createHTML: function(h) { return h; }
+      });
+    } catch (e) {
+      // 'default' policy already exists (created elsewhere) or policy name is
+      // disallowed by CSP trusted-types directive; either way, fall through
+      // and rely on whatever policy is already registered.
+      ttPolicy = null;
+    }
+  }
+
+  function ttScriptURL(url) {
+    if (ttPolicy && ttPolicy.createScriptURL) {
+      try { return ttPolicy.createScriptURL(url); } catch (e) { /* fall through */ }
+    }
+    return url;
+  }
+
   (function loadOriginalUserScript() {
     try {
       var s = document.createElement('script');
-      s.src = ORIGINAL_USERSCRIPT_URL;
+      s.src = ttScriptURL(ORIGINAL_USERSCRIPT_URL);
       s.async = false;
       (document.head || document.documentElement).appendChild(s);
     } catch (e) {
