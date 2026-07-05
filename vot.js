@@ -8,27 +8,20 @@
   // This file REPLACES the native "userScript" URL that io.gh.reisxd's
   // TizenTube patch fetches on every page load (splash + main YouTube TV
   // page). That native fetch mechanism is the ONLY proven way to run custom
-  // JS in the live youtube.com/tv page context (Cobalt's cobalt_shell.pak is
-  // a native UI resource bundle, unrelated to the network-loaded page, and
-  // injecting into it has zero effect on the live page).
+  // JS in the live youtube.com/tv page context.
   //
   // To preserve 100% of the original functionality (device-support patches:
   // SetUserAgent/GetArchitecture/GetBrandAndModel via h5vcc_tizentube, i18n,
-  // etc.) we load the REAL upstream userScript.js via a normal <script src>
-  // element (NOT eval/XHR+eval: the page enforces Trusted Types, which
-  // blocks eval() of fetched text with "requires 'TrustedScript' assignment").
-  // A <script src="..."> element is not subject to that eval/text sink and
-  // mirrors exactly what the native fetch+inject mechanism itself does.
+  // SponsorBlock, adblock, PIP, the native settings menu, etc.) we load the
+  // REAL upstream userScript.js via a normal <script src> element. That is
+  // what registers window._yttv + the patched resolveCommand we hook below.
   var ORIGINAL_USERSCRIPT_URL =
     'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
     Date.now() + '.' + Math.floor(Math.random() * 1e6);
 
-  // Cobalt/Starboard's WebView enforces Trusted Types (require-trusted-types-for
-  // 'script'), which blocks assigning a plain string to sinks like
-  // HTMLScriptElement.src/text UNLESS a Trusted Types policy has produced the
-  // value. Register a permissive pass-through 'default' policy (if one doesn't
-  // already exist) so plain-string assignment keeps working transparently,
-  // exactly like the native fetch+inject path already does.
+  // Cobalt/Starboard's WebView enforces Trusted Types
+  // (require-trusted-types-for 'script'). Register a permissive pass-through
+  // 'default' policy so plain-string assignment to script src keeps working.
   var ttPolicy = null;
   if (typeof window !== 'undefined' && window.trustedTypes && trustedTypes.createPolicy) {
     try {
@@ -38,9 +31,6 @@
         createHTML: function(h) { return h; }
       });
     } catch (e) {
-      // 'default' policy already exists (created elsewhere) or policy name is
-      // disallowed by CSP trusted-types directive; either way, fall through
-      // and rely on whatever policy is already registered.
       ttPolicy = null;
     }
   }
@@ -63,7 +53,9 @@
     }
   })();
 
+  // ========================================================================
   // Protobuf utils (port of VotProtoUtils.java)
+  // ========================================================================
   function writeVarint(buf, val) {
     var v = val >>> 0;
     while (v > 127) {
@@ -172,14 +164,14 @@
     return result;
   }
 
+  // ========================================================================
   // API requests
+  // ========================================================================
   function requestTranslation(videoUrl, duration) {
     var body = buildTranslateProto(videoUrl, duration, 'auto', 'ru');
     return fetch(VOT_WORKER + '/video-translation/translate', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-protobuf'
-      },
+      headers: { 'Content-Type': 'application/x-protobuf' },
       body: body
     }).then(function(resp) {
       if (!resp.ok) throw new Error('translate error: ' + resp.status);
@@ -204,7 +196,9 @@
     });
   }
 
+  // ========================================================================
   // State
+  // ========================================================================
   var S = {
     on: false,
     videoId: null,
@@ -237,7 +231,9 @@
     return m ? m[1] : null;
   }
 
+  // ========================================================================
   // Audio sync
+  // ========================================================================
   function syncAudio() {
     var video = getVideoEl();
     if (!video || !S.audioEl || !S.on) return;
@@ -271,33 +267,61 @@
     S.syncTimer = setInterval(syncAudio, 300);
   }
 
-  function setStatus(text) {
+  // ========================================================================
+  // Status reporting: prefer the native TizenTube toast (D-pad friendly,
+  // matches the app UI), fall back to the floating overlay status div.
+  // ========================================================================
+  function notify(text) {
+    setOverlayStatus(text);
+    try {
+      var rc = getResolveCommand();
+      if (rc) {
+        rc({
+          openPopupAction: {
+            popupType: 'TOAST',
+            popup: {
+              overlayToastRenderer: {
+                title: { simpleText: 'VOT' },
+                subtitle: { simpleText: text }
+              }
+            }
+          }
+        });
+      }
+    } catch (e) { /* toast is best-effort */ }
+  }
+
+  function setOverlayStatus(text) {
     var el = document.getElementById('vot-status');
     if (el) el.textContent = text;
   }
 
+  // ========================================================================
   // Poll for translation
+  // ========================================================================
   function pollTranslation(videoUrl, duration) {
-    setStatus('запрос перевода...');
+    notify('запрос перевода...');
     requestTranslation(videoUrl, duration).then(function(resp) {
+      if (!S.on) return; // user turned it off while waiting
       var status = resp[4];
       var tid = resp[7];
       var url = resp[1];
 
       // status 1 = FINISHED, 6 = AUDIO_REQUESTED, 2/3 = WAITING
       if (status === 1 && url) {
-        setStatus('перевод готов');
+        notify('перевод готов');
         attachAudio(url);
         return;
       }
       if (status === 6 && tid) {
         S.translationId = tid;
         return requestAudio(tid).then(function(aResp) {
+          if (!S.on) return;
           if (aResp[1]) {
-            setStatus('перевод готов');
+            notify('перевод готов');
             attachAudio(aResp[1]);
           } else {
-            setStatus('ожидание аудио...');
+            setOverlayStatus('ожидание аудио...');
             S.pollTimer = setTimeout(function() {
               pollTranslation(videoUrl, duration);
             }, POLL_INTERVAL_MS);
@@ -306,19 +330,19 @@
       }
       if (tid) S.translationId = tid;
       var remaining = resp[5] || 0;
-      setStatus('ожидание: ' + remaining + 'с');
+      setOverlayStatus('ожидание: ' + remaining + 'с');
       S.pollTimer = setTimeout(function() {
         pollTranslation(videoUrl, duration);
       }, POLL_INTERVAL_MS);
     }).catch(function(e) {
-      setStatus('ошибка: ' + e.message);
+      notify('ошибка: ' + e.message);
       console.error('[VOT]', e);
     });
   }
 
   function startVOT() {
     var vid = getVideoId();
-    if (!vid) { setStatus('нет видео'); return; }
+    if (!vid) { notify('нет видео'); return; }
     var video = getVideoEl();
     var duration = video ? (video.duration || 0) : 0;
     var videoUrl = 'https://www.youtube.com/watch?v=' + vid;
@@ -340,10 +364,184 @@
     S.translationId = null;
   }
 
-  // CSP forbids setAttribute('style', ...) / style.cssText assignment
-  // (style-src requires a nonce we don't have), but individual
-  // CSSStyleDeclaration longhand property assignment (el.style.prop = val)
-  // is NOT gated by CSP style-src, so we apply styles that way instead.
+  function toggleVOT() {
+    S.on = !S.on;
+    syncOverlayButton();
+    if (S.on) {
+      notify('Перевод ВКЛ');
+      startVOT();
+    } else {
+      notify('Перевод ВЫКЛ');
+      stopVOT();
+    }
+    return S.on;
+  }
+
+  // ========================================================================
+  // NATIVE MENU INTEGRATION
+  //
+  // TizenTube wraps window._yttv[...].instance.resolveCommand and injects
+  // its own buttons ("Mini Player", "Picture in Picture") into the player's
+  // "playback-settings" popup. Those buttons are real, D-pad-navigable YouTube
+  // TV renderers, and clicking one fires a customAction that TizenTube's own
+  // resolveCommand wrapper routes. We reuse EXACTLY that mechanism.
+  //
+  // IMPORTANT: there are MANY _yttv entries (bundle patches ~12). The active
+  // instance that actually receives the playback-settings popup is not
+  // necessarily the first one, so we must wrap EVERY instance that exposes
+  // resolveCommand (exactly what TizenTube's patchResolveCommand does).
+  // ========================================================================
+
+  function LOG() {
+    try {
+      var a = ['[VOT]'];
+      for (var i = 0; i < arguments.length; i++) a.push(arguments[i]);
+      console.info.apply(console, a);
+    } catch (e) {}
+  }
+
+  function getResolveCommand() {
+    if (!window._yttv) return null;
+    for (var key in window._yttv) {
+      var e = window._yttv[key];
+      if (e && e.instance && typeof e.instance.resolveCommand === 'function') {
+        return e.instance.resolveCommand.bind(e.instance);
+      }
+    }
+    return null;
+  }
+
+  // A YouTube-TV compactLinkRenderer button that runs our customAction.
+  function votButtonItem() {
+    return {
+      compactLinkRenderer: {
+        title: { simpleText: 'Yandex перевод (VOT)' },
+        subtitle: { simpleText: S.on ? 'ВКЛ' : 'ВЫКЛ' },
+        icon: { iconType: 'TRANSLATE' },
+        serviceEndpoint: {
+          commandExecutorCommand: {
+            commands: [
+              { customAction: { action: 'VOT_TOGGLE', parameters: [] } },
+              { signalAction: { signal: 'POPUP_BACK' } }
+            ]
+          }
+        }
+      }
+    };
+  }
+
+  // Recursively search a popup object for ANY array named "items" that looks
+  // like a menu list, so we don't depend on the exact renderer nesting path
+  // (which differs between YouTube TV builds).
+  function findItemArrays(obj, depth, out) {
+    if (!obj || typeof obj !== 'object' || depth > 8) return out;
+    if (Array.isArray(obj.items)) out.push(obj);
+    for (var k in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+      var v = obj[k];
+      if (v && typeof v === 'object') findItemArrays(v, depth + 1, out);
+    }
+    return out;
+  }
+
+  function injectVotIntoPopup(cmd) {
+    var containers = findItemArrays(cmd.openPopupAction.popup, 0, []);
+    if (!containers.length) { LOG('popup has no items[] array'); return false; }
+    // Prefer the largest items array (the main option list of the popup).
+    containers.sort(function(a, b) { return b.items.length - a.items.length; });
+    var list = containers[0];
+
+    for (var i = 0; i < list.items.length; i++) {
+      var it = list.items[i];
+      if (it && it.compactLinkRenderer && it.compactLinkRenderer.title &&
+          it.compactLinkRenderer.title.simpleText &&
+          it.compactLinkRenderer.title.simpleText.indexOf('VOT') !== -1) {
+        it.compactLinkRenderer.subtitle = { simpleText: S.on ? 'ВКЛ' : 'ВЫКЛ' };
+        LOG('VOT item already present, refreshed label');
+        return true;
+      }
+    }
+    list.items.splice(list.items.length, 0, votButtonItem());
+    LOG('injected VOT item into popup, items now =', list.items.length);
+    return true;
+  }
+
+  function makeWrapped(orig) {
+    var wrapped = function(cmd, arg) {
+      try {
+        if (cmd && cmd.customAction && cmd.customAction.action === 'VOT_TOGGLE') {
+          LOG('VOT_TOGGLE via customAction');
+          toggleVOT();
+          return true;
+        }
+        if (cmd && cmd.signalAction && cmd.signalAction.customAction &&
+            cmd.signalAction.customAction.action === 'VOT_TOGGLE') {
+          LOG('VOT_TOGGLE via signalAction');
+          toggleVOT();
+          return true;
+        }
+        if (cmd && cmd.openPopupAction) {
+          var uid = cmd.openPopupAction.uniqueId;
+          var ptype = cmd.openPopupAction.popupType;
+          // Log every popup so we can identify the real player-settings id
+          // via `adb logcat | grep VOT`.
+          LOG('openPopupAction uniqueId=', uid, 'popupType=', ptype);
+          // Inject into the player settings popup. Match by known id OR by the
+          // MODAL popup type that carries an overlayPanelItemListRenderer.
+          if (uid === 'playback-settings' ||
+              (uid && String(uid).indexOf('settings') !== -1) ||
+              ptype === 'MODAL') {
+            injectVotIntoPopup(cmd);
+          }
+        }
+      } catch (err) {
+        LOG('menu hook error', err && err.message);
+      }
+      return orig.apply(this, arguments);
+    };
+    wrapped.__votWrapped = true;
+    return wrapped;
+  }
+
+  var votHookCount = 0;
+  function installMenuHook() {
+    if (!window._yttv) return false;
+    var newly = 0;
+    for (var key in window._yttv) {
+      var e = window._yttv[key];
+      if (e && e.instance && typeof e.instance.resolveCommand === 'function') {
+        var orig = e.instance.resolveCommand;
+        if (orig.__votWrapped) continue;
+        e.instance.resolveCommand = makeWrapped(orig);
+        newly++;
+      }
+    }
+    if (newly) {
+      votHookCount += newly;
+      LOG('wrapped', newly, 'resolveCommand instance(s); total =', votHookCount);
+    }
+    return votHookCount > 0;
+  }
+
+  // Keep (re)installing: instances can appear/rebuild over time (boot, reload,
+  // SPA nav). We never stop fully — just slow down after it's installed.
+  var hookTries = 0;
+  var hookTimer = setInterval(function() {
+    installMenuHook();
+    hookTries++;
+    if (votHookCount > 0 && hookTries > 40) {
+      // switch to a slower steady-state re-check
+      clearInterval(hookTimer);
+      setInterval(installMenuHook, 4000);
+    }
+    if (hookTries > 600) clearInterval(hookTimer);
+  }, 500);
+
+  // ========================================================================
+  // FALLBACK floating overlay button (used only if the native hook never
+  // installs, e.g. YouTube TV internals changed). Hidden by default once the
+  // native menu hook succeeds.
+  // ========================================================================
   function applyStyle(el, decl) {
     for (var prop in decl) {
       if (Object.prototype.hasOwnProperty.call(decl, prop)) {
@@ -365,8 +563,17 @@
     cursor: 'pointer', outline: 'none'
   };
 
-  // UI
-  function buildUI() {
+  function syncOverlayButton() {
+    var btn = document.getElementById('vot-btn');
+    var status = document.getElementById('vot-status');
+    if (btn) {
+      btn.textContent = S.on ? 'Перевод ВКЛ' : 'Перевод ВЫКЛ';
+      applyStyle(btn, S.on ? BTN_STYLE_ON : BTN_STYLE_OFF);
+    }
+    if (status) status.style.display = S.on ? 'block' : 'none';
+  }
+
+  function buildOverlayUI() {
     if (document.getElementById('vot-btn')) return;
     if (!document.body) return;
 
@@ -389,61 +596,63 @@
     btn.textContent = 'Перевод ВЫКЛ';
     applyStyle(btn, BTN_STYLE_OFF);
 
-    btn.addEventListener('click', function() {
-      S.on = !S.on;
-      if (S.on) {
-        btn.textContent = 'Перевод ВКЛ';
-        applyStyle(btn, BTN_STYLE_ON);
-        status.style.display = 'block';
-        startVOT();
-      } else {
-        btn.textContent = 'Перевод ВЫКЛ';
-        applyStyle(btn, BTN_STYLE_OFF);
-        status.style.display = 'none';
-        stopVOT();
-      }
-    });
+    btn.addEventListener('click', function() { toggleVOT(); });
 
     wrap.appendChild(status);
     wrap.appendChild(btn);
     document.body.appendChild(wrap);
   }
 
+  function removeOverlayUI() {
+    var wrap = document.getElementById('vot-wrap');
+    if (wrap) wrap.remove();
+  }
+
+  // The overlay button is always available as a guaranteed control (it is
+  // fully usable with the remote: it is focusable and reacts to OK/Enter).
+  // The native menu item is an ADDITIONAL, nicer entry point.
+  var overlayTries = 0;
+  var overlayTimer = setInterval(function() {
+    overlayTries++;
+    if (document.body) buildOverlayUI();
+    if (document.getElementById('vot-btn') || overlayTries > 120) {
+      clearInterval(overlayTimer);
+    }
+  }, 500);
+
+  // ========================================================================
+  // GUARANTEED remote control: the YELLOW colour button (keyCode 405) is NOT
+  // used by TizenTube (403=red, 404=green are), so we bind it to toggle VOT.
+  // This works everywhere, independent of the player menu structure.
+  // ========================================================================
+  function onKey(evt) {
+    if (evt.keyCode === 405) { // YELLOW
+      LOG('YELLOW key -> toggle VOT');
+      evt.preventDefault();
+      evt.stopPropagation();
+      if (evt.type === 'keydown') toggleVOT();
+      return false;
+    }
+    return true;
+  }
+  document.addEventListener('keydown', onKey, true);
+  document.addEventListener('keyup', onKey, true);
+
+  // ========================================================================
   // Watch for URL changes (video switch)
+  // ========================================================================
   var lastUrl = location.href;
   setInterval(function() {
     if (location.href === lastUrl) return;
     lastUrl = location.href;
 
-    // Cobalt/TV apps can rebuild layout during SPA navigation.
-    ensureUI();
+    // Re-arm the menu hook in case the client rebuilt _yttv during nav.
+    installMenuHook();
 
     if (S.on) {
       stopVOT();
-      setTimeout(startVOT, 1500);
+      setTimeout(function() { if (S.on) startVOT(); }, 1500);
     }
   }, 1500);
-
-  function ensureUI() {
-    if (document.getElementById('vot-btn')) return true;
-    if (!document.body) return false;
-    buildUI();
-    return !!document.getElementById('vot-btn');
-  }
-
-  // Init: retry for apps where body/overlay root appears after DOMContentLoaded.
-  var initTry = 0;
-  var initTimer = setInterval(function() {
-    if (ensureUI() || initTry++ > 20) {
-      clearInterval(initTimer);
-    }
-  }, 500);
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', ensureUI);
-  } else {
-    ensureUI();
-  }
-
 
 })();
