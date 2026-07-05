@@ -505,6 +505,18 @@
           toggleVOT();
           return true;
         }
+        // Diagnostic: log action-like commands (not plain navigation/popups)
+        // so we can see exactly what a menu click routes through.
+        if (cmd && typeof cmd === 'object' && !cmd.openPopupAction) {
+          if (cmd.signalAction || cmd.customAction || cmd.commandExecutorCommand) {
+            var sig = cmd.signalAction && cmd.signalAction.signal;
+            var act = cmd.customAction && cmd.customAction.action;
+            var nExec = cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands &&
+                        cmd.commandExecutorCommand.commands.length;
+            LOG('cmd keys=', Object.keys(cmd).join(','),
+                '| signal=', sig, '| action=', act, '| execN=', nExec);
+          }
+        }
         if (cmd && cmd.openPopupAction) {
           var uid = cmd.openPopupAction.uniqueId;
           var ptype = cmd.openPopupAction.popupType;
