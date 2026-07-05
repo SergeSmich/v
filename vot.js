@@ -209,7 +209,16 @@
     on: false,
     videoId: null,
     translationId: null,
-    audioEl: null,
+    // Web Audio playback state (Cobalt can't play a progressive mp3 via
+    // <audio>.src -- "Progressive streams are unsupported" -- so we decode the
+    // whole file with AudioContext.decodeAudioData and play the PCM buffer).
+    audioCtx: null,
+    audioBuffer: null,
+    srcNode: null,
+    gainNode: null,
+    startedAtCtxTime: 0,   // audioCtx.currentTime when current srcNode started
+    startedAtOffset: 0,    // buffer offset (s) the current srcNode started from
+    playing: false,
     pollTimer: null,
     syncTimer: null
   };
@@ -238,66 +247,132 @@
   }
 
   // ========================================================================
-  // Audio sync
+  // Web Audio playback + sync
+  //
+  // Cobalt's media pipeline rejects a progressive mp3 played through an
+  // <audio> element ("Progressive streams are unsupported" /
+  // IsSupportedMediaMimeType(audio/mpeg) -> false). So instead we decode the
+  // ENTIRE downloaded mp3 into a PCM AudioBuffer via the Web Audio API and
+  // schedule it on an AudioContext -- a completely separate code path that
+  // does NOT go through the "progressive" demuxer. We keep the translation in
+  // sync with the video by (re)starting the buffer at the right offset
+  // whenever it drifts more than SYNC_THRESHOLD seconds.
   // ========================================================================
+  function ensureCtx() {
+    if (!S.audioCtx) {
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error('no AudioContext');
+      S.audioCtx = new Ctx();
+      S.gainNode = S.audioCtx.createGain();
+      S.gainNode.gain.value = 1.0;
+      S.gainNode.connect(S.audioCtx.destination);
+    }
+    if (S.audioCtx.state === 'suspended') {
+      try { S.audioCtx.resume(); } catch (e) {}
+    }
+    return S.audioCtx;
+  }
+
+  // Where in the translation buffer we currently are (seconds).
+  function currentAudioOffset() {
+    if (!S.audioCtx || !S.playing) return S.startedAtOffset;
+    return S.startedAtOffset + (S.audioCtx.currentTime - S.startedAtCtxTime);
+  }
+
+  function stopSrcNode() {
+    if (S.srcNode) {
+      try { S.srcNode.onended = null; S.srcNode.stop(); } catch (e) {}
+      try { S.srcNode.disconnect(); } catch (e) {}
+      S.srcNode = null;
+    }
+    S.playing = false;
+  }
+
+  // Start playing the decoded buffer from `offset` seconds.
+  function playFromOffset(offset) {
+    if (!S.audioBuffer) return;
+    stopSrcNode();
+    if (offset < 0) offset = 0;
+    if (offset >= S.audioBuffer.duration) return; // past the end
+    var node = S.audioCtx.createBufferSource();
+    node.buffer = S.audioBuffer;
+    node.connect(S.gainNode);
+    node.start(0, offset);
+    S.srcNode = node;
+    S.startedAtCtxTime = S.audioCtx.currentTime;
+    S.startedAtOffset = offset;
+    S.playing = true;
+  }
+
   function syncAudio() {
     var video = getVideoEl();
-    if (!video || !S.audioEl || !S.on) return;
-    if (Math.abs(S.audioEl.currentTime - video.currentTime) > SYNC_THRESHOLD) {
-      S.audioEl.currentTime = video.currentTime;
-    }
+    if (!video || !S.audioBuffer || !S.on) return;
+
+    // Mirror the video's play/pause state.
     if (video.paused) {
-      S.audioEl.pause();
-    } else {
-      S.audioEl.play().catch(function() {});
+      if (S.playing) {
+        // Freeze: remember where we are and stop the node.
+        S.startedAtOffset = currentAudioOffset();
+        stopSrcNode();
+      }
+      video.volume = 0.10;
+      return;
+    }
+
+    var target = video.currentTime;
+    var drift = Math.abs(currentAudioOffset() - target);
+    if (!S.playing || drift > SYNC_THRESHOLD) {
+      playFromOffset(target);
     }
     video.volume = 0.10;
   }
 
   // The translated mp3 lives on vtrans.s3-private.mds.yandex.net, which is in
-  // neither the page's CSP connect-src NOR media-src, so we can neither fetch
-  // it directly nor assign it to <audio>.src. BUT media-src allows `blob:` and
-  // connect-src allows our worker. So: fetch the mp3 THROUGH the worker's
-  // audio-proxy (connect-src OK), turn the bytes into a blob: URL (media-src
-  // OK), and feed that to <audio>. This is the final CSP bridge.
+  // neither the page's CSP connect-src NOR media-src. We fetch it THROUGH the
+  // worker's audio-proxy (connect-src allows the worker), then decode the raw
+  // bytes with Web Audio (bypasses Cobalt's progressive-stream limitation).
   function attachAudio(url) {
     var proxied = VOT_WORKER + '/video-translation/audio-proxy?u=' +
                   encodeURIComponent(url);
     notify('загрузка озвучки...');
     fetch(proxied, { method: 'GET' }).then(function(resp) {
       if (!resp.ok) throw new Error('audio-proxy ' + resp.status);
-      return resp.blob();
-    }).then(function(blob) {
+      return resp.arrayBuffer();
+    }).then(function(arrayBuf) {
       if (!S.on) return; // turned off during download
-      var objUrl = URL.createObjectURL(blob);
-      mountAudioEl(objUrl);
-      notify('озвучка запущена');
+      var ctx = ensureCtx();
+      notify('декодирование...');
+      // decodeAudioData supports both promise and callback styles; handle both.
+      var p = ctx.decodeAudioData(arrayBuf, function(buf) {
+        onDecoded(buf);
+      }, function(err) {
+        notify('ошибка декодирования');
+        console.error('[VOT] decodeAudioData', err);
+      });
+      if (p && typeof p.then === 'function') {
+        p.then(onDecoded).catch(function(err) {
+          notify('ошибка декодирования');
+          console.error('[VOT] decodeAudioData', err);
+        });
+      }
     }).catch(function(e) {
       notify('ошибка аудио: ' + e.message);
       console.error('[VOT] attachAudio', e);
     });
   }
 
-  function mountAudioEl(srcUrl) {
-    if (S.audioEl) {
-      S.audioEl.pause();
-      if (S.audioEl.__objUrl) {
-        try { URL.revokeObjectURL(S.audioEl.__objUrl); } catch (e) {}
-      }
-      S.audioEl.remove();
-    }
-    var a = document.createElement('audio');
-    a.src = srcUrl;
-    a.__objUrl = srcUrl;
-    a.volume = 1.0;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    S.audioEl = a;
+  function onDecoded(buf) {
+    if (!S.on || !buf) return;
+    S.audioBuffer = buf;
+    LOG('audio decoded, duration =', buf.duration.toFixed(1), 's');
+    notify('озвучка запущена');
     var video = getVideoEl();
-    if (video) {
-      try { a.currentTime = video.currentTime || 0; } catch (e) {}
-      if (!video.paused) a.play().catch(function() {});
+    if (video && !video.paused) {
+      playFromOffset(video.currentTime || 0);
+    } else {
+      S.startedAtOffset = video ? (video.currentTime || 0) : 0;
     }
+    if (video) video.volume = 0.10;
     clearInterval(S.syncTimer);
     S.syncTimer = setInterval(syncAudio, 300);
   }
@@ -336,13 +411,19 @@
   // ========================================================================
   function pollTranslation(videoUrl, duration) {
     notify('запрос перевода...');
+    LOG('poll translate url=', videoUrl, 'dur=', duration);
     requestTranslation(videoUrl, duration).then(function(resp) {
       if (!S.on) return; // user turned it off while waiting
       var status = resp[4];
       var tid = resp[7];
       var url = resp[1];
+      var remaining = resp[5] || 0;
+      // Mirror the translation status into logcat so it's visible over adb
+      // (TOAST alone doesn't show up there). Statuses: 0=FAILED, 1=FINISHED,
+      // 2=WAITING, 3=LONG_WAITING, 5=PART_CONTENT, 6=AUDIO_REQUESTED.
+      LOG('translate resp: status=', status, 'remaining=', remaining,
+          'hasUrl=', !!url, 'tid=', tid);
 
-      // status 1 = FINISHED, 6 = AUDIO_REQUESTED, 2/3 = WAITING
       if (status === 1 && url) {
         notify('перевод готов');
         attachAudio(url);
@@ -352,6 +433,7 @@
         S.translationId = tid;
         return requestAudio(tid).then(function(aResp) {
           if (!S.on) return;
+          LOG('audio resp: hasUrl=', !!aResp[1]);
           if (aResp[1]) {
             notify('перевод готов');
             attachAudio(aResp[1]);
@@ -364,13 +446,14 @@
         });
       }
       if (tid) S.translationId = tid;
-      var remaining = resp[5] || 0;
+      notify('ожидание перевода (' + status + '): ' + remaining + 'с');
       setOverlayStatus('ожидание: ' + remaining + 'с');
       S.pollTimer = setTimeout(function() {
         pollTranslation(videoUrl, duration);
       }, POLL_INTERVAL_MS);
     }).catch(function(e) {
       notify('ошибка: ' + e.message);
+      LOG('poll error', e && e.message);
       console.error('[VOT]', e);
     });
   }
@@ -388,14 +471,9 @@
   function stopVOT() {
     clearTimeout(S.pollTimer);
     clearInterval(S.syncTimer);
-    if (S.audioEl) {
-      S.audioEl.pause();
-      if (S.audioEl.__objUrl) {
-        try { URL.revokeObjectURL(S.audioEl.__objUrl); } catch (e) {}
-      }
-      S.audioEl.remove();
-      S.audioEl = null;
-    }
+    stopSrcNode();
+    S.audioBuffer = null;
+    S.startedAtOffset = 0;
     var video = getVideoEl();
     if (video) video.volume = 1.0;
     S.videoId = null;
