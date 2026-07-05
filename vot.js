@@ -54,6 +54,93 @@
   })();
 
   // ========================================================================
+  // mpg123-decoder (WASM mp3 -> PCM), loaded IN-PAGE.
+  //
+  // Cobalt's only built-in AudioContext.decodeAudioData codec is WAV -- it
+  // logs "Cobalt WAV decoder initializing" and throws a DOMException on mp3
+  // (IsSupportedMediaMimeType(audio/mpeg) -> false). So we can't rely on the
+  // browser to decode Yandex's mp3.
+  //
+  // Instead we decode the mp3 ourselves with the mpg123-decoder WASM bundle
+  // (Cobalt has experimental WebAssembly on android-arm), producing raw
+  // Float32 PCM that we drop straight into a Web Audio AudioBuffer. This also
+  // avoids doing the (CPU-heavy) decode server-side, which would blow the
+  // Cloudflare Workers free-plan 10ms CPU limit.
+  //
+  // jsDelivr /npm is already trusted by script-src (the original userScript
+  // above loads from cdn.jsdelivr.net/npm), so we can <script src> it too.
+  var MPG_DECODER_URL =
+    'https://cdn.jsdelivr.net/npm/mpg123-decoder@1.0.3/dist/mpg123-decoder.min.js';
+  var mpgLoadPromise = null;
+
+  function loadMpgDecoder() {
+    if (mpgLoadPromise) return mpgLoadPromise;
+    mpgLoadPromise = new Promise(function(resolve, reject) {
+      try {
+        if (window['mpg123-decoder'] && window['mpg123-decoder'].MPEGDecoder) {
+          resolve(window['mpg123-decoder']);
+          return;
+        }
+        // The UMD bundle evaluates `class ... extends globalThis.Worker` at
+        // load time. If Cobalt has no Worker, that throws and the whole script
+        // fails to load. We only ever use the MAIN-THREAD MPEGDecoder (which
+        // never touches Worker), so a harmless stub is enough to let the
+        // bundle define its (unused) worker subclass.
+        if (typeof window.Worker === 'undefined') {
+          try { window.Worker = function VotNoopWorker() {}; } catch (e) {}
+        }
+        var s = document.createElement('script');
+        s.src = ttScriptURL(MPG_DECODER_URL);
+        s.async = true;
+        s.onload = function() {
+          var lib = window['mpg123-decoder'];
+          if (lib && lib.MPEGDecoder) resolve(lib);
+          else reject(new Error('mpg123-decoder loaded but no MPEGDecoder'));
+        };
+        s.onerror = function() {
+          reject(new Error('failed to load mpg123-decoder'));
+        };
+        (document.head || document.documentElement).appendChild(s);
+      } catch (e) {
+        reject(e);
+      }
+    });
+    return mpgLoadPromise;
+  }
+
+  // Decode an mp3 ArrayBuffer to a Web Audio AudioBuffer using the WASM
+  // decoder. Returns a Promise<AudioBuffer>.
+  function decodeMp3ToAudioBuffer(arrayBuf, ctx) {
+    return loadMpgDecoder().then(function(lib) {
+      var decoder = new lib.MPEGDecoder();
+      return decoder.ready.then(function() {
+        var mp3 = new Uint8Array(arrayBuf);
+        var out;
+        try {
+          out = decoder.decode(mp3);
+        } finally {
+          try { decoder.free(); } catch (e) {}
+        }
+        var channelData = out.channelData;      // Float32Array[]
+        var samples = out.samplesDecoded;
+        var rate = out.sampleRate;
+        if (!channelData || !channelData.length || !samples) {
+          throw new Error('mp3 decoded to 0 samples');
+        }
+        // Build the AudioBuffer at the decoder's native sample rate; the
+        // AudioContext resamples on playback if it differs from ctx.sampleRate.
+        var buf = ctx.createBuffer(channelData.length, samples, rate);
+        for (var ch = 0; ch < channelData.length; ch++) {
+          var src = channelData[ch];
+          if (src.length > samples) src = src.subarray(0, samples);
+          buf.getChannelData(ch).set(src);
+        }
+        return buf;
+      });
+    });
+  }
+
+  // ========================================================================
   // Protobuf utils (port of VotProtoUtils.java)
   // ========================================================================
   function writeVarint(buf, val) {
@@ -342,21 +429,16 @@
       if (!S.on) return; // turned off during download
       var ctx = ensureCtx();
       notify('декодирование...');
-      // decodeAudioData supports both promise and callback styles; handle both.
-      var p = ctx.decodeAudioData(arrayBuf, function(buf) {
+      LOG('mp3 downloaded, bytes =', arrayBuf.byteLength, '-> WASM decode');
+      // Cobalt's decodeAudioData only handles WAV and throws a DOMException on
+      // mp3, so decode the mp3 ourselves with the mpg123-decoder WASM bundle
+      // and hand the resulting PCM AudioBuffer to onDecoded().
+      return decodeMp3ToAudioBuffer(arrayBuf, ctx).then(function(buf) {
+        if (!S.on) return;
         onDecoded(buf);
-      }, function(err) {
-        notify('ошибка декодирования');
-        console.error('[VOT] decodeAudioData', err);
       });
-      if (p && typeof p.then === 'function') {
-        p.then(onDecoded).catch(function(err) {
-          notify('ошибка декодирования');
-          console.error('[VOT] decodeAudioData', err);
-        });
-      }
     }).catch(function(e) {
-      notify('ошибка аудио: ' + e.message);
+      notify('ошибка аудио: ' + (e && e.message));
       console.error('[VOT] attachAudio', e);
     });
   }
