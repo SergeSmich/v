@@ -417,7 +417,14 @@
     return null;
   }
 
-  // A YouTube-TV compactLinkRenderer button that runs our customAction.
+  // A YouTube-TV compactLinkRenderer button that toggles VOT.
+  //
+  // IMPORTANT: we use signalAction.signal (NOT customAction). TizenTube's own
+  // resolveCommand wrapper swallows EVERY customAction (it does
+  // `if (cmd.customAction) { ...; return true; }`), so if its wrapper sits
+  // outside ours, our customAction never reaches us. It only touches
+  // signalAction when there's a nested customAction — a plain signal passes
+  // straight through to the inner (our) wrapper regardless of wrapper order.
   function votButtonItem() {
     return {
       compactLinkRenderer: {
@@ -427,7 +434,7 @@
         serviceEndpoint: {
           commandExecutorCommand: {
             commands: [
-              { customAction: { action: 'VOT_TOGGLE', parameters: [] } },
+              { signalAction: { signal: 'VOT_TOGGLE' } },
               { signalAction: { signal: 'POPUP_BACK' } }
             ]
           }
@@ -472,17 +479,29 @@
     return true;
   }
 
+  // Recursively check whether a command (or any nested command inside a
+  // commandExecutorCommand) carries our VOT_TOGGLE marker, in any of the
+  // forms YouTube TV might route it through.
+  function isVotToggle(cmd, depth) {
+    if (!cmd || typeof cmd !== 'object' || depth > 6) return false;
+    if (cmd.signalAction && cmd.signalAction.signal === 'VOT_TOGGLE') return true;
+    if (cmd.customAction && cmd.customAction.action === 'VOT_TOGGLE') return true;
+    if (cmd.signalAction && cmd.signalAction.customAction &&
+        cmd.signalAction.customAction.action === 'VOT_TOGGLE') return true;
+    if (cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands) {
+      var cs = cmd.commandExecutorCommand.commands;
+      for (var i = 0; i < cs.length; i++) {
+        if (isVotToggle(cs[i], depth + 1)) return true;
+      }
+    }
+    return false;
+  }
+
   function makeWrapped(orig) {
     var wrapped = function(cmd, arg) {
       try {
-        if (cmd && cmd.customAction && cmd.customAction.action === 'VOT_TOGGLE') {
-          LOG('VOT_TOGGLE via customAction');
-          toggleVOT();
-          return true;
-        }
-        if (cmd && cmd.signalAction && cmd.signalAction.customAction &&
-            cmd.signalAction.customAction.action === 'VOT_TOGGLE') {
-          LOG('VOT_TOGGLE via signalAction');
+        if (isVotToggle(cmd, 0)) {
+          LOG('VOT_TOGGLE received -> toggle');
           toggleVOT();
           return true;
         }
@@ -543,100 +562,32 @@
     if (hookTries > 600) clearInterval(hookTimer);
   }, 500);
 
-  // ========================================================================
-  // FALLBACK floating overlay button (used only if the native hook never
-  // installs, e.g. YouTube TV internals changed). Hidden by default once the
-  // native menu hook succeeds.
-  // ========================================================================
-  function applyStyle(el, decl) {
-    for (var prop in decl) {
-      if (Object.prototype.hasOwnProperty.call(decl, prop)) {
-        el.style[prop] = decl[prop];
-      }
-    }
-  }
-
-  var BTN_STYLE_OFF = {
-    padding: '10px 20px', fontSize: '17px', fontWeight: 'bold',
-    background: 'rgba(0,0,0,0.85)', color: '#fff',
-    border: '2px solid #f90', borderRadius: '10px',
-    cursor: 'pointer', outline: 'none'
-  };
-  var BTN_STYLE_ON = {
-    padding: '10px 20px', fontSize: '17px', fontWeight: 'bold',
-    background: 'rgba(0,0,0,0.85)', color: '#fff',
-    border: '2px solid #0f0', borderRadius: '10px',
-    cursor: 'pointer', outline: 'none'
-  };
-
-  function syncOverlayButton() {
-    var btn = document.getElementById('vot-btn');
-    var status = document.getElementById('vot-status');
-    if (btn) {
-      btn.textContent = S.on ? 'Перевод ВКЛ' : 'Перевод ВЫКЛ';
-      applyStyle(btn, S.on ? BTN_STYLE_ON : BTN_STYLE_OFF);
-    }
-    if (status) status.style.display = S.on ? 'block' : 'none';
-  }
-
-  function buildOverlayUI() {
-    if (document.getElementById('vot-btn')) return;
-    if (!document.body) return;
-
-    var wrap = document.createElement('div');
-    wrap.id = 'vot-wrap';
-    applyStyle(wrap, {
-      position: 'fixed', bottom: '70px', right: '16px', zIndex: '99999',
-      display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px'
-    });
-
-    var status = document.createElement('div');
-    status.id = 'vot-status';
-    applyStyle(status, {
-      fontSize: '14px', color: '#fff', background: 'rgba(0,0,0,0.75)',
-      padding: '4px 12px', borderRadius: '6px', display: 'none'
-    });
-
-    var btn = document.createElement('button');
-    btn.id = 'vot-btn';
-    btn.textContent = 'Перевод ВЫКЛ';
-    applyStyle(btn, BTN_STYLE_OFF);
-
-    btn.addEventListener('click', function() { toggleVOT(); });
-
-    wrap.appendChild(status);
-    wrap.appendChild(btn);
-    document.body.appendChild(wrap);
-  }
-
-  function removeOverlayUI() {
-    var wrap = document.getElementById('vot-wrap');
-    if (wrap) wrap.remove();
-  }
-
-  // The overlay button is always available as a guaranteed control (it is
-  // fully usable with the remote: it is focusable and reacts to OK/Enter).
-  // The native menu item is an ADDITIONAL, nicer entry point.
-  var overlayTries = 0;
-  var overlayTimer = setInterval(function() {
-    overlayTries++;
-    if (document.body) buildOverlayUI();
-    if (document.getElementById('vot-btn') || overlayTries > 120) {
-      clearInterval(overlayTimer);
-    }
-  }, 500);
+  // The floating overlay button was removed: the native player-menu item is
+  // the intended control. syncOverlayButton is kept as a no-op so callers
+  // (toggleVOT) don't need to change.
+  function syncOverlayButton() { /* no overlay */ }
 
   // ========================================================================
   // GUARANTEED remote control: the YELLOW colour button (keyCode 405) is NOT
   // used by TizenTube (403=red, 404=green are), so we bind it to toggle VOT.
   // This works everywhere, independent of the player menu structure.
+  //
+  // Debounced: a single physical press emits several keydown/keyup/repeat
+  // events; we act on keydown only and ignore anything within 800ms so one
+  // press = one toggle.
   // ========================================================================
+  var lastToggleAt = 0;
   function onKey(evt) {
     if (evt.keyCode === 405) { // YELLOW
-      LOG('YELLOW key -> toggle VOT');
       evt.preventDefault();
       evt.stopPropagation();
-      if (evt.type === 'keydown') toggleVOT();
+      if (evt.type === 'keydown') {
+        var now = Date.now();
+        if (now - lastToggleAt < 800) return false; // debounce repeats
+        lastToggleAt = now;
+        LOG('YELLOW key -> toggle VOT');
+        toggleVOT();
+      }
       return false;
     }
     return true;
