@@ -254,20 +254,49 @@
     video.volume = 0.10;
   }
 
+  // The translated mp3 lives on vtrans.s3-private.mds.yandex.net, which is in
+  // neither the page's CSP connect-src NOR media-src, so we can neither fetch
+  // it directly nor assign it to <audio>.src. BUT media-src allows `blob:` and
+  // connect-src allows our worker. So: fetch the mp3 THROUGH the worker's
+  // audio-proxy (connect-src OK), turn the bytes into a blob: URL (media-src
+  // OK), and feed that to <audio>. This is the final CSP bridge.
   function attachAudio(url) {
+    var proxied = VOT_WORKER + '/video-translation/audio-proxy?u=' +
+                  encodeURIComponent(url);
+    notify('загрузка озвучки...');
+    fetch(proxied, { method: 'GET' }).then(function(resp) {
+      if (!resp.ok) throw new Error('audio-proxy ' + resp.status);
+      return resp.blob();
+    }).then(function(blob) {
+      if (!S.on) return; // turned off during download
+      var objUrl = URL.createObjectURL(blob);
+      mountAudioEl(objUrl);
+      notify('озвучка запущена');
+    }).catch(function(e) {
+      notify('ошибка аудио: ' + e.message);
+      console.error('[VOT] attachAudio', e);
+    });
+  }
+
+  function mountAudioEl(srcUrl) {
     if (S.audioEl) {
       S.audioEl.pause();
+      if (S.audioEl.__objUrl) {
+        try { URL.revokeObjectURL(S.audioEl.__objUrl); } catch (e) {}
+      }
       S.audioEl.remove();
     }
     var a = document.createElement('audio');
-    a.src = url;
+    a.src = srcUrl;
+    a.__objUrl = srcUrl;
     a.volume = 1.0;
     a.style.display = 'none';
     document.body.appendChild(a);
     S.audioEl = a;
     var video = getVideoEl();
-    if (video && !video.paused) {
-      a.play().catch(function() {});
+    if (video) {
+      try { a.currentTime = video.currentTime || 0; } catch (e) {}
+      if (!video.paused) a.play().catch(function() {});
     }
     clearInterval(S.syncTimer);
     S.syncTimer = setInterval(syncAudio, 300);
@@ -361,6 +390,9 @@
     clearInterval(S.syncTimer);
     if (S.audioEl) {
       S.audioEl.pause();
+      if (S.audioEl.__objUrl) {
+        try { URL.revokeObjectURL(S.audioEl.__objUrl); } catch (e) {}
+      }
       S.audioEl.remove();
       S.audioEl = null;
     }
