@@ -1,7 +1,7 @@
 (function() {
   'use strict';
 
-  var VOT_WORKER = 'https://vot-worker.kload.workers.dev';
+  var VOT_WORKER = 'https://vot.sormat1.workers.dev';
   var POLL_INTERVAL_MS = 3000;
   var SYNC_THRESHOLD = 0.8;
 
@@ -165,180 +165,40 @@
   }
 
   // ========================================================================
-  // Yandex VOT request signing (ported from @vot.js / FOSWLY vot-worker).
+  // API requests
   //
-  // The Yandex video-translation API (proxied by vot-worker) rejects
-  // unsigned requests with HTTP 415. Every request needs:
-  //   1. A session (secretKey + uuid) obtained from POST /session/create.
-  //   2. HMAC-SHA256 signature headers:
-  //        Vtrans-Signature : hex(HMAC(HMAC_KEY, body))
-  //        Sec-Vtrans-Sk    : session.secretKey
-  //        Sec-Vtrans-Token : hex(HMAC(HMAC_KEY, "uuid:path:version"))
-  //                           + ":uuid:path:version"
-  // Constants extracted from the official @vot.js client bundle.
+  // We talk to OUR signing worker (see vot-signing-worker.js), which does the
+  // Yandex session + HMAC signing SERVER-SIDE and returns permissive CORS
+  // (Access-Control-Allow-Headers: *). So the in-page request stays a PLAIN
+  // POST with only Content-Type — no custom headers, hence no CORS preflight
+  // rejection. Set VOT_WORKER to your deployed worker URL.
   // ========================================================================
-  var YA_HMAC_KEY = 'bt8xH3VOlb4mqf0nqAibnDOoiPlXsisf';
-  var YA_COMPONENT_VERSION = '26.4.1.1026';
-  var YA_SESSION_MODULE = 'video-translation';
-  var PATH_TRANSLATE = '/video-translation/translate';
-  var PATH_AUDIO = '/video-translation/audio';
-  var PATH_SESSION = '/session/create';
-
-  var utf8Encoder = (typeof TextEncoder !== 'undefined') ? new TextEncoder() : null;
-
-  function utf8Bytes(str) {
-    if (utf8Encoder) return utf8Encoder.encode(str);
-    var bin = unescape(encodeURIComponent(str));
-    var arr = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-    return arr;
-  }
-
-  function toHex(buf) {
-    var arr = new Uint8Array(buf);
-    var s = '';
-    for (var i = 0; i < arr.length; i++) {
-      s += (arr[i] < 16 ? '0' : '') + arr[i].toString(16);
-    }
-    return s;
-  }
-
-  function getCrypto() {
-    return (typeof window !== 'undefined' && window.crypto) ? window.crypto : (self && self.crypto);
-  }
-
-  // HMAC-SHA256(key, data) -> hex string. data must be a Uint8Array.
-  function getSignature(dataBytes) {
-    var c = getCrypto();
-    if (!c || !c.subtle) return Promise.reject(new Error('WebCrypto unavailable'));
-    return c.subtle.importKey(
-      'raw', utf8Bytes(YA_HMAC_KEY),
-      { name: 'HMAC', hash: { name: 'SHA-256' } },
-      false, ['sign', 'verify']
-    ).then(function(key) {
-      return c.subtle.sign('HMAC', key, dataBytes);
-    }).then(function(sig) {
-      return toHex(sig);
-    });
-  }
-
-  // Build Sec-Vtrans-* + Vtrans-Signature headers for a signed request.
-  function getSecYaHeaders(session, bodyBytes, path) {
-    var token = session.uuid + ':' + path + ':' + YA_COMPONENT_VERSION;
-    return Promise.all([
-      getSignature(bodyBytes),
-      getSignature(utf8Bytes(token))
-    ]).then(function(res) {
-      var bodySign = res[0];
-      var tokenSign = res[1];
-      return {
-        'Vtrans-Signature': bodySign,
-        'Sec-Vtrans-Sk': session.secretKey,
-        'Sec-Vtrans-Token': tokenSign + ':' + token
-      };
-    });
-  }
-
-  function getUUID() {
-    var c = getCrypto();
-    if (c && c.getRandomValues) {
-      var b = new Uint8Array(16);
-      c.getRandomValues(b);
-      return toHex(b);
-    }
-    var s = '';
-    for (var i = 0; i < 32; i++) s += Math.floor(Math.random() * 16).toString(16);
-    return s;
-  }
-
-  // Base headers the Yandex API expects (browser drops forbidden ones like
-  // User-Agent silently; the worker adds its own, so that's fine).
-  function baseHeaders() {
-    return {
-      'Accept': 'application/x-protobuf',
-      'Accept-Language': 'en',
-      'Content-Type': 'application/x-protobuf'
-    };
-  }
-
-  function mergeHeaders(a, b) {
-    var out = {};
-    for (var k in a) if (a.hasOwnProperty(k)) out[k] = a[k];
-    for (var k2 in b) if (b.hasOwnProperty(k2)) out[k2] = b[k2];
-    return out;
-  }
-
-  // ---- Session ----------------------------------------------------------
-  var SESSION = null; // { secretKey, expires, timestamp, uuid }
-
-  function encodeSessionRequest(uuid, module) {
-    var buf = [];
-    writeString(buf, 1, uuid);
-    writeString(buf, 2, module);
-    return new Uint8Array(buf);
-  }
-
-  function nowSec() { return Math.floor(Date.now() / 1000); }
-
-  function getSession() {
-    if (SESSION && (SESSION.timestamp + SESSION.expires) > nowSec()) {
-      return Promise.resolve(SESSION);
-    }
-    var uuid = getUUID();
-    var body = encodeSessionRequest(uuid, YA_SESSION_MODULE);
-    return getSignature(body).then(function(sign) {
-      return fetch(VOT_WORKER + PATH_SESSION, {
-        method: 'POST',
-        headers: mergeHeaders(baseHeaders(), { 'Vtrans-Signature': sign }),
-        body: body
-      });
+  function requestTranslation(videoUrl, duration) {
+    var body = buildTranslateProto(videoUrl, duration, 'auto', 'ru');
+    return fetch(VOT_WORKER + '/video-translation/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-protobuf' },
+      body: body
     }).then(function(resp) {
-      if (!resp.ok) throw new Error('session error: ' + resp.status);
-      return resp.arrayBuffer();
-    }).then(function(buf) {
-      var r = readProto(buf);
-      // field 1 = secretKey (string), field 2 = expires (int32 seconds)
-      SESSION = {
-        secretKey: r[1] || '',
-        expires: r[2] || 0,
-        timestamp: nowSec(),
-        uuid: uuid
-      };
-      if (!SESSION.secretKey) throw new Error('no secretKey in session');
-      return SESSION;
-    });
-  }
-
-  // ---- Signed API requests ---------------------------------------------
-  function signedRequest(path, bodyBytes) {
-    return getSession().then(function(session) {
-      return getSecYaHeaders(session, bodyBytes, path).then(function(sec) {
-        return fetch(VOT_WORKER + path, {
-          method: 'POST',
-          headers: mergeHeaders(baseHeaders(), sec),
-          body: bodyBytes
-        });
-      });
-    }).then(function(resp) {
-      if (!resp.ok) throw new Error('http ' + resp.status);
+      if (!resp.ok) throw new Error('translate error: ' + resp.status);
       return resp.arrayBuffer();
     }).then(function(buf) {
       return readProto(buf);
     });
   }
 
-  function requestTranslation(videoUrl, duration) {
-    var body = buildTranslateProto(videoUrl, duration, 'auto', 'ru');
-    return signedRequest(PATH_TRANSLATE, body).catch(function(e) {
-      throw new Error('translate error: ' + e.message);
-    });
-  }
-
   function requestAudio(translationId) {
     var buf = [];
     writeString(buf, 1, translationId);
-    return signedRequest(PATH_AUDIO, new Uint8Array(buf)).catch(function(e) {
-      throw new Error('audio error: ' + e.message);
+    return fetch(VOT_WORKER + '/video-translation/audio', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-protobuf' },
+      body: new Uint8Array(buf)
+    }).then(function(resp) {
+      if (!resp.ok) throw new Error('audio error: ' + resp.status);
+      return resp.arrayBuffer();
+    }).then(function(buf) {
+      return readProto(buf);
     });
   }
 
