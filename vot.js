@@ -29,7 +29,7 @@
   //      so device-support patches (UA/brand/arch) stay alive.
   // ======================================================================
 
-  var MARK = 'VOTDIAG-2026-10-23-b2';
+  var MARK = 'VOTDIAG-2026-10-23-b3';
   var ORIG_URL =
     'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
     Date.now() + '.' + Math.floor(Math.random() * 1e6);
@@ -415,6 +415,7 @@
   probeUrl('worker /', WORKER + '/');
   probeUrl('jsdelivr', 'https://cdn.jsdelivr.net/gh/SergeSmich/v@main/vot.js');
   probeUrl('localhost:8012 apps', 'http://localhost:8012/apps/YouTube');
+  probeUrl('bridge /ping 127.0.0.1:8013', 'http://127.0.0.1:8013/ping');
 
   // ---- Java bridge discovery ---------------------------------------------------
   (function () {
