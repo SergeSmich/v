@@ -1,819 +1,420 @@
-(function() {
+(function () {
   'use strict';
 
-  var VOT_WORKER = 'https://vot.sormat1.workers.dev';
-  var POLL_INTERVAL_MS = 3000;
-  var SYNC_THRESHOLD = 0.8;
-
-  // This file REPLACES the native "userScript" URL that io.gh.reisxd's
-  // TizenTube patch fetches on every page load (splash + main YouTube TV
-  // page). That native fetch mechanism is the ONLY proven way to run custom
-  // JS in the live youtube.com/tv page context.
+  // ======================================================================
+  // VOT DIAGNOSTIC BUILD (2026-10-23, rev b1)
   //
-  // To preserve 100% of the original functionality (device-support patches:
-  // SetUserAgent/GetArchitecture/GetBrandAndModel via h5vcc_tizentube, i18n,
-  // SponsorBlock, adblock, PIP, the native settings menu, etc.) we load the
-  // REAL upstream userScript.js via a normal <script src> element. That is
-  // what registers window._yttv + the patched resolveCommand we hook below.
-  var ORIGINAL_USERSCRIPT_URL =
+  // Loaded as the patched native "userScript" URL inside the live
+  // https://www.youtube.com/tv page. Passively probes the environment and
+  // prints findings to console (logcat tag "cobalt", every line prefixed
+  // with "[VOT]" for grep).
+  //
+  // Probes:
+  //   1. capabilities: MediaSource/AudioContext/WebAssembly/crypto.subtle,
+  //      TextEncoder, Worker, Trusted Types state
+  //   2. network reachability FROM the page:
+  //      - LAN dev server http://192.168.1.186:8013 (ping + vot.js over XHR)
+  //      - Cloudflare vot worker (vot.sormat1.workers.dev)
+  //      - cdn.jsdelivr.net (control)
+  //      each probed first in cors mode, then in no-cors mode, so a CSP
+  //      block is distinguishable from a mere CORS mismatch.
+  //   3. full Yandex protocol FROM the page: session/create (HMAC signed
+  //      with shared secret) -> video-translation/translate -> range fetch
+  //      of the translated mp3 (if any).
+  //   4. player plumbing: video duration/currentTime/src, googlevideo URLs
+  //      visible in performance resource entries (can the page see the
+  //      audio track at all?), media element errors.
+  //   5. remote key stream (ring buffer of last 10 keycodes).
+  //   6. original upstream userScript.js is still loaded in a <script src>
+  //      so device-support patches (UA/brand/arch) stay alive.
+  // ======================================================================
+
+  var MARK = 'VOTDIAG-2026-10-23-b1';
+  var ORIG_URL =
     'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
     Date.now() + '.' + Math.floor(Math.random() * 1e6);
+  var LAN = 'http://192.168.1.186:8013';
+  var WORKER = 'https://vot.sormat1.workers.dev';
+  var YANDEX = 'https://api.browser.yandex.ru';
+  var HMAC_KEY = 'bt8xH3VOlb4mqf0nqAibnDOoiPlXsisf';
+  var HBK_VER = '25.12.4.1198';
 
-  // Cobalt/Starboard's WebView enforces Trusted Types
-  // (require-trusted-types-for 'script'). Register a permissive pass-through
-  // 'default' policy so plain-string assignment to script src keeps working.
-  var ttPolicy = null;
-  if (typeof window !== 'undefined' && window.trustedTypes && trustedTypes.createPolicy) {
-    try {
-      ttPolicy = trustedTypes.createPolicy('default', {
-        createScriptURL: function(u) { return u; },
-        createScript: function(s) { return s; },
-        createHTML: function(h) { return h; }
-      });
-    } catch (e) {
-      ttPolicy = null;
+  var HAVE_WE =
+    typeof TextEncoder !== 'undefined' &&
+    typeof TextDecoder !== 'undefined' &&
+    typeof fetch === 'function';
+
+  var yttvLogged = false;
+  var lastKeyStr = '';
+  var keyRing = [];
+  var pending = {}; // watchId -> {t0, probed, durWarned, noVideoLogged, laterLogged, gvProbed}
+
+  function log(m) { try { console.log('[VOT] ' + m); } catch (e) { } }
+  function warn(m) { try { console.warn('[VOT] ' + m); } catch (e) { } }
+  function j(x) { try { return JSON.stringify(x); } catch (e) { return String(x); } }
+
+  log(MARK + ' boot href=' + String(location.href).slice(0, 150));
+  if (!HAVE_WE) warn('TextEncoder/fetch unavailable - protocol probes will be skipped');
+
+  // ---- Trusted Types pass-through ---------------------------------------
+  try {
+    if (window.trustedTypes && window.trustedTypes.createPolicy) {
+      if (!window.trustedTypes.defaultPolicy) {
+        window.trustedTypes.createPolicy('default', {
+          createHTML: function (s) { return s; },
+          createScript: function (s) { return s; },
+          createScriptURL: function (s) { return s; }
+        });
+        log('trusted-types: default policy installed');
+      } else {
+        log('trusted-types: default policy already present');
+      }
+    } else {
+      log('trusted-types: API absent');
     }
+  } catch (e) {
+    warn('trusted-types install failed: ' + e);
   }
 
-  function ttScriptURL(url) {
-    if (ttPolicy && ttPolicy.createScriptURL) {
-      try { return ttPolicy.createScriptURL(url); } catch (e) { /* fall through */ }
-    }
-    return url;
-  }
+  // ---- capabilities -------------------------------------------------------
+  var caps = {
+    ua: String(navigator.userAgent).slice(0, 120),
+    lang: navigator.language,
+    mediaSource: !!window.MediaSource,
+    audioCtx: !!(window.AudioContext || window.webkitAudioContext),
+    webAssembly: !!window.WebAssembly,
+    cryptoSubtle: !!(window.crypto && window.crypto.subtle && window.crypto.subtle.sign),
+    textEncoder: typeof TextEncoder,
+    scriptWorker: typeof window.Worker,
+    perfMemory: !!(window.performance && window.performance.memory)
+  };
+  try { caps.mseMpeg = window.MediaSource && window.MediaSource.isTypeSupported('audio/mpeg'); } catch (e) { caps.mseMpeg = 'ERR'; }
+  try { caps.mseOpus = window.MediaSource && window.MediaSource.isTypeSupported('audio/webm; codecs="opus"'); } catch (e) { caps.mseOpus = 'ERR'; }
+  try { caps.mseAac = window.MediaSource && window.MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"'); } catch (e) { caps.mseAac = 'ERR'; }
+  try { caps.canPlayMpeg = String(document.createElement('video').canPlayType('audio/mpeg')); } catch (e) { caps.canPlayMpeg = 'ERR'; }
+  try { caps.canPlayAac = String(document.createElement('video').canPlayType('audio/aac')); } catch (e) { caps.canPlayAac = 'ERR'; }
+  log('caps ' + j(caps));
 
-  (function loadOriginalUserScript() {
-    try {
-      var s = document.createElement('script');
-      s.src = ttScriptURL(ORIGINAL_USERSCRIPT_URL);
-      s.async = false;
-      (document.head || document.documentElement).appendChild(s);
-    } catch (e) {
-      console.warn('[VOT] failed to load original userScript', e);
-    }
+  // ---- original upstream userScript (preserves device support) -----------
+  (function () {
+    var sc = document.createElement('script');
+    sc.src = ORIG_URL;
+    sc.onload = function () { log('origuserscript loaded'); };
+    sc.onerror = function () { warn('origuserscript FAILED (CSP/network?)'); };
+    (document.head || document.documentElement || document).appendChild(sc);
   })();
 
-  // ========================================================================
-  // mpg123-decoder (WASM mp3 -> PCM), loaded IN-PAGE.
-  //
-  // Cobalt's only built-in AudioContext.decodeAudioData codec is WAV -- it
-  // logs "Cobalt WAV decoder initializing" and throws a DOMException on mp3
-  // (IsSupportedMediaMimeType(audio/mpeg) -> false). So we can't rely on the
-  // browser to decode Yandex's mp3.
-  //
-  // Instead we decode the mp3 ourselves with the mpg123-decoder WASM bundle
-  // (Cobalt has experimental WebAssembly on android-arm), producing raw
-  // Float32 PCM that we drop straight into a Web Audio AudioBuffer. This also
-  // avoids doing the (CPU-heavy) decode server-side, which would blow the
-  // Cloudflare Workers free-plan 10ms CPU limit.
-  //
-  // jsDelivr /npm is already trusted by script-src (the original userScript
-  // above loads from cdn.jsdelivr.net/npm), so we can <script src> it too.
-  var MPG_DECODER_URL =
-    'https://cdn.jsdelivr.net/npm/mpg123-decoder@1.0.3/dist/mpg123-decoder.min.js';
-  var mpgLoadPromise = null;
+  // ---- remote key watcher --------------------------------------------------
+  try {
+    document.addEventListener('keydown', function (e) {
+      keyRing.push(e.keyCode);
+      if (keyRing.length > 10) keyRing.shift();
+    }, true);
+  } catch (e) { }
 
-  function loadMpgDecoder() {
-    if (mpgLoadPromise) return mpgLoadPromise;
-    mpgLoadPromise = new Promise(function(resolve, reject) {
-      try {
-        if (window['mpg123-decoder'] && window['mpg123-decoder'].MPEGDecoder) {
-          resolve(window['mpg123-decoder']);
-          return;
-        }
-        // The UMD bundle evaluates `class ... extends globalThis.Worker` at
-        // load time. If Cobalt has no Worker, that throws and the whole script
-        // fails to load. We only ever use the MAIN-THREAD MPEGDecoder (which
-        // never touches Worker), so a harmless stub is enough to let the
-        // bundle define its (unused) worker subclass.
-        if (typeof window.Worker === 'undefined') {
-          try { window.Worker = function VotNoopWorker() {}; } catch (e) {}
-        }
-        var s = document.createElement('script');
-        s.src = ttScriptURL(MPG_DECODER_URL);
-        s.async = true;
-        s.onload = function() {
-          var lib = window['mpg123-decoder'];
-          if (lib && lib.MPEGDecoder) resolve(lib);
-          else reject(new Error('mpg123-decoder loaded but no MPEGDecoder'));
-        };
-        s.onerror = function() {
-          reject(new Error('failed to load mpg123-decoder'));
-        };
-        (document.head || document.documentElement).appendChild(s);
-      } catch (e) {
-        reject(e);
-      }
-    });
-    return mpgLoadPromise;
+  // ---- protobuf encoder/decoder --------------------------------------------
+  function wvarint(a, v) {
+    v = v >>> 0;
+    while (v > 127) { a.push((v & 127) | 128); v = v >>> 7; }
+    a.push(v);
+  }
+  function wtag(a, f, t) { wvarint(a, (f << 3) | t); }
+  function wstr(a, f, s) {
+    var b = new TextEncoder().encode(s);
+    wtag(a, f, 2);
+    wvarint(a, b.length);
+    for (var i = 0; i < b.length; i++) a.push(b[i]);
+  }
+  function wbool(a, f, v) { wtag(a, f, 0); wvarint(a, v ? 1 : 0); }
+  function wint(a, f, v) { wtag(a, f, 0); wvarint(a, v); }
+  function wdbl(a, f, v) {
+    var dv = new DataView(new ArrayBuffer(8));
+    dv.setFloat64(0, v, true);
+    wtag(a, f, 1);
+    for (var i = 0; i < 8; i++) a.push(dv.getUint8(i));
   }
 
-  // Decode an mp3 ArrayBuffer to a Web Audio AudioBuffer using the WASM
-  // decoder. Returns a Promise<AudioBuffer>.
-  function decodeMp3ToAudioBuffer(arrayBuf, ctx) {
-    return loadMpgDecoder().then(function(lib) {
-      var decoder = new lib.MPEGDecoder();
-      return decoder.ready.then(function() {
-        var mp3 = new Uint8Array(arrayBuf);
-        var out;
-        try {
-          out = decoder.decode(mp3);
-        } finally {
-          try { decoder.free(); } catch (e) {}
-        }
-        var channelData = out.channelData;      // Float32Array[]
-        var samples = out.samplesDecoded;
-        var rate = out.sampleRate;
-        if (!channelData || !channelData.length || !samples) {
-          throw new Error('mp3 decoded to 0 samples');
-        }
-        // Build the AudioBuffer at the decoder's native sample rate; the
-        // AudioContext resamples on playback if it differs from ctx.sampleRate.
-        var buf = ctx.createBuffer(channelData.length, samples, rate);
-        for (var ch = 0; ch < channelData.length; ch++) {
-          var src = channelData[ch];
-          if (src.length > samples) src = src.subarray(0, samples);
-          buf.getChannelData(ch).set(src);
-        }
-        return buf;
+  function buildTranslate(url, dur) {
+    // Correct per April-2025 protocol: firstRequest=true, duration>0,
+    // language auto + forceSourceLang, configVersion=2, responseLanguage ru.
+    var a = [];
+    wstr(a, 3, url);
+    wbool(a, 5, true);      // firstRequest
+    wdbl(a, 6, dur || 0);   // duration
+    wbool(a, 7, true);      // unknown0
+    wstr(a, 8, 'auto');     // source language
+    wbool(a, 9, true);      // forceSourceLang
+    wstr(a, 14, 'ru');      // response language
+    wbool(a, 15, true);     // unknown2
+    wint(a, 16, 2);         // configVersion (2 since 2025-04)
+    return new Uint8Array(a);
+  }
+
+  function buildSession(uuid) {
+    var a = [];
+    wstr(a, 1, uuid);
+    wstr(a, 2, 'video-translation');
+    return new Uint8Array(a);
+  }
+
+  function readProto(u8) {
+    var r = {};
+    var p = 0;
+    function lvarint() {
+      var v = 0, s = 0, b;
+      do { b = u8[p++]; v |= (b & 127) << s; s += 7; } while (b & 128);
+      return v >>> 0;
+    }
+    while (p < u8.length) {
+      var t = lvarint();
+      var f = t >>> 3;
+      var w = t & 7;
+      if (w === 0) { r[f] = lvarint(); }
+      else if (w === 2) {
+        var l = lvarint();
+        var sb = u8.slice(p, p + l);
+        p += l;
+        try { r[f] = new TextDecoder().decode(sb); } catch (e3) { r[f] = sb; }
+      }
+      else if (w === 1) { r['d' + f] = 'double'; p += 8; }
+      else if (w === 5) { p += 4; }
+      else break;
+    }
+    return r;
+  }
+
+  function toHex(u8) {
+    var s = '';
+    for (var i = 0; i < u8.length; i++) {
+      var h = u8[i].toString(16);
+      s += h.length < 2 ? '0' + h : h;
+    }
+    return s;
+  }
+
+  function hmacHex(u8) {
+    if (!(window.crypto && window.crypto.subtle && window.crypto.subtle.sign)) return Promise.resolve(null);
+    var keyBytes = new TextEncoder().encode(HMAC_KEY);
+    return window.crypto.subtle
+      .importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+      .then(function (k) { return window.crypto.subtle.sign('HMAC', k, u8); })
+      .then(function (buf) { return toHex(new Uint8Array(buf)); },
+            function (e) { warn('hmac failed: ' + (e && e.message)); return null; });
+  }
+
+  function keysOf(o) {
+    var r = [];
+    for (var k in o) { if (o.hasOwnProperty(k)) r.push(k); }
+    return r.sort();
+  }
+
+  // ---- generic reachability probe (cors, then opaque) -----------------------
+  function probeUrl(label, url) {
+    return fetch(url, { cache: 'no-store' })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          log(label + ' cors http=' + r.status + ' body=' + t.slice(0, 24));
+        });
+      }, function (e1) {
+        // retry opaque: opaque success + cors TypeError means CSP allows but
+        // response lacks CORS headers; both failing means CSP/network block.
+        return fetch(url, { cache: 'no-store', mode: 'no-cors' })
+          .then(function (r) {
+            log(label + ' cors FAILED (' + e1.name + '), opaque http=' + r.status +
+                ' => CONNECT-SRC ALLOWS it; cors-only mismatch');
+          }, function (e2) {
+            warn(label + ' BLOCKED: ' + e1.name + ': ' + e1.message + ' | no-cors: ' + e2.name + ': ' + e2.message);
+          });
       });
-    });
   }
 
-  // ========================================================================
-  // Protobuf utils (port of VotProtoUtils.java)
-  // ========================================================================
-  function writeVarint(buf, val) {
-    var v = val >>> 0;
-    while (v > 127) {
-      buf.push((v & 127) | 128);
-      v = v >>> 7;
-    }
-    buf.push(v);
-  }
-
-  function writeTag(buf, field, type) {
-    writeVarint(buf, (field << 3) | type);
-  }
-
-  function writeString(buf, field, str) {
-    var bytes = unescape(encodeURIComponent(str));
-    var arr = [];
-    for (var i = 0; i < bytes.length; i++) {
-      arr.push(bytes.charCodeAt(i));
-    }
-    writeTag(buf, field, 2);
-    writeVarint(buf, arr.length);
-    for (var j = 0; j < arr.length; j++) {
-      buf.push(arr[j]);
-    }
-  }
-
-  function writeBool(buf, field, val) {
-    writeTag(buf, field, 0);
-    writeVarint(buf, val ? 1 : 0);
-  }
-
-  function writeDouble(buf, field, val) {
-    writeTag(buf, field, 1);
-    var tmp = new ArrayBuffer(8);
-    new DataView(tmp).setFloat64(0, val, true);
-    var arr = new Uint8Array(tmp);
-    for (var i = 0; i < 8; i++) {
-      buf.push(arr[i]);
-    }
-  }
-
-  function writeInt32(buf, field, val) {
-    writeTag(buf, field, 0);
-    writeVarint(buf, val);
-  }
-
-  function buildTranslateProto(videoUrl, duration, fromLang, toLang) {
-    var buf = [];
-    writeString(buf, 3, videoUrl);
-    writeBool(buf, 5, false);
-    writeDouble(buf, 6, duration || 0);
-    writeInt32(buf, 7, 1);
-    writeString(buf, 8, fromLang || 'auto');
-    writeString(buf, 14, toLang || 'ru');
-    writeInt32(buf, 15, 1);
-    writeInt32(buf, 16, 2);
-    writeBool(buf, 18, false);
-    return new Uint8Array(buf);
-  }
-
-  function readProto(arrayBuf) {
-    var data = new Uint8Array(arrayBuf);
-    var pos = 0;
-    var result = {};
-    while (pos < data.length) {
-      var tag = 0, shift = 0, b;
-      do {
-        b = data[pos++];
-        tag |= (b & 127) << shift;
-        shift += 7;
-      } while (b & 128);
-      var field = tag >>> 3;
-      var wire = tag & 7;
-      if (wire === 0) {
-        var v = 0; shift = 0;
-        do {
-          b = data[pos++];
-          v |= (b & 127) << shift;
-          shift += 7;
-        } while (b & 128);
-        result[field] = v;
-      } else if (wire === 2) {
-        var len = 0; shift = 0;
-        do {
-          b = data[pos++];
-          len |= (b & 127) << shift;
-          shift += 7;
-        } while (b & 128);
-        var strBytes = data.slice(pos, pos + len);
-        try {
-          var str = '';
-          for (var i = 0; i < strBytes.length; i++) {
-            str += String.fromCharCode(strBytes[i]);
+  // ---- Yandex protocol from inside the page ---------------------------------
+  function yandexSession() {
+    var CH = '0123456789ABCDEF';
+    var uuid = '';
+    for (var i = 0; i < 32; i++) uuid += CH.charAt(Math.floor(Math.random() * 16));
+    var body = buildSession(uuid);
+    return hmacHex(body).then(function (sig) {
+      var hd = { 'Content-Type': 'application/x-protobuf' };
+      if (sig) hd['Vtrans-Signature'] = sig;
+      return fetch(YANDEX + '/session/create', { method: 'POST', headers: hd, cache: 'no-store', body: body })
+        .then(function (r) {
+          if (r.status !== 200) {
+            return r.text().catch(function () { return ''; }).then(function (t) {
+              warn('yandex session/create http=' + r.status + ' body=' + t.slice(0, 80));
+              return null;
+            });
           }
-          result[field] = decodeURIComponent(escape(str));
-        } catch(e) {
-          result[field] = strBytes;
-        }
-        pos += len;
-      } else if (wire === 1) {
-        pos += 8;
-      } else if (wire === 5) {
-        pos += 4;
-      }
-    }
-    return result;
+          return r.arrayBuffer().then(function (ab) {
+            var o = readProto(new Uint8Array(ab));
+            var sk = typeof o[1] === 'string' ? o[1] : '';
+            log('yandex session/create ok exp=' + o[2] + ' sk=' + sk.slice(0, 12) + '...');
+            return { uuid: uuid, sk: sk };
+          });
+        }, function (e) {
+          warn('yandex session/create FETCH-ERR ' + e.name + ': ' + e.message);
+          return null;
+        });
+    });
   }
 
-  // ========================================================================
-  // API requests
-  //
-  // We talk to OUR signing worker (see vot-signing-worker.js), which does the
-  // Yandex session + HMAC signing SERVER-SIDE and returns permissive CORS
-  // (Access-Control-Allow-Headers: *). So the in-page request stays a PLAIN
-  // POST with only Content-Type — no custom headers, hence no CORS preflight
-  // rejection. Set VOT_WORKER to your deployed worker URL.
-  // ========================================================================
-  function requestTranslation(videoUrl, duration) {
-    var body = buildTranslateProto(videoUrl, duration, 'auto', 'ru');
-    return fetch(VOT_WORKER + '/video-translation/translate', {
+  function yandexTranslate(sess, videoId, dur) {
+    if (!sess) return Promise.resolve(null);
+    var body = buildTranslate('https://www.youtube.com/watch?v=' + videoId, dur);
+    var tok = sess.uuid + ':' + toHex(body) + ':' + HBK_VER;
+    return Promise.all([hmacHex(body), hmacHex(new TextEncoder().encode(tok))]).then(function (res) {
+      var hd = { 'Content-Type': 'application/x-protobuf' };
+      if (res[0]) hd['Vtrans-Signature'] = res[0];
+      if (sess.sk) {
+        hd['Sec-Vtrans-Sk'] = sess.sk;
+        hd['Sec-Vtrans-Token'] = (res[1] || '') + ':' + tok;
+      }
+      return fetch(YANDEX + '/video-translation/translate', { method: 'POST', headers: hd, cache: 'no-store', body: body })
+        .then(function (r) {
+          if (r.status !== 200) {
+            return r.text().catch(function () { return ''; }).then(function (t) {
+              warn('yandex translate http=' + r.status + ' body=' + t.slice(0, 120));
+            });
+          }
+          return r.arrayBuffer().then(function (ab) {
+            var o = readProto(new Uint8Array(ab));
+            log('yandex translate resp status=' + o[4] + ' remaining=' + o[5] +
+                ' tid=' + o[7] + ' msg=' + (o[9] || '') +
+                ' url=' + String(o[1] || '').slice(0, 70));
+            if (o[1]) mp3RangeProbe(o[1]);
+          });
+        }, function (e) {
+          warn('yandex translate FETCH-ERR ' + e.name + ': ' + e.message);
+        });
+    });
+  }
+
+  function mp3RangeProbe(u) {
+    fetch(u, { headers: { 'Range': 'bytes=0-255' } })
+      .then(function (r) {
+        log('mp3 range http=' + r.status + ' ct=' + r.headers.get('content-type') +
+            ' cr=' + r.headers.get('content-range'));
+      }, function (e) { warn('mp3 range ERR ' + e.name + ': ' + e.message); });
+  }
+
+  // Sessionless baseline through the worker (what the production vot.js does).
+  function workerTranslateProbe(videoId, dur) {
+    var body = buildTranslate('https://www.youtube.com/watch?v=' + videoId, dur);
+    return fetch(WORKER + '/video-translation/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-protobuf' },
+      cache: 'no-store',
       body: body
-    }).then(function(resp) {
-      if (!resp.ok) throw new Error('translate error: ' + resp.status);
-      return resp.arrayBuffer();
-    }).then(function(buf) {
-      return readProto(buf);
+    }).then(function (r) {
+      return r.arrayBuffer().catch(function () { return new ArrayBuffer(0); }).then(function (ab) {
+        var o = readProto(new Uint8Array(ab));
+        log('worker translate http=' + r.status + ' status=' + o[4] + ' remaining=' + o[5]);
+      });
+    }, function (e) {
+      warn('worker translate FETCH-ERR ' + e.name + ': ' + e.message + ' (TypeError usually == CSP connect-src)');
     });
   }
 
-  function requestAudio(translationId) {
-    var buf = [];
-    writeString(buf, 1, translationId);
-    return fetch(VOT_WORKER + '/video-translation/audio', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-protobuf' },
-      body: new Uint8Array(buf)
-    }).then(function(resp) {
-      if (!resp.ok) throw new Error('audio error: ' + resp.status);
-      return resp.arrayBuffer();
-    }).then(function(buf) {
-      return readProto(buf);
-    });
+  // ---- player plumbing -------------------------------------------------------
+  function findVideo() {
+    var vs = document.querySelectorAll('video');
+    var best = null;
+    for (var i = 0; i < vs.length; i++) {
+      var v = vs[i];
+      var d = v.duration > 0 ? v.duration : 0;
+      if (!best || d > (best.duration > 0 ? best.duration : 0)) best = v;
+    }
+    return best || (vs.length ? vs[0] : null);
   }
 
-  // ========================================================================
-  // State
-  // ========================================================================
-  var S = {
-    on: false,
-    videoId: null,
-    translationId: null,
-    // Web Audio playback state (Cobalt can't play a progressive mp3 via
-    // <audio>.src -- "Progressive streams are unsupported" -- so we decode the
-    // whole file with AudioContext.decodeAudioData and play the PCM buffer).
-    audioCtx: null,
-    audioBuffer: null,
-    srcNode: null,
-    gainNode: null,
-    startedAtCtxTime: 0,   // audioCtx.currentTime when current srcNode started
-    startedAtOffset: 0,    // buffer offset (s) the current srcNode started from
-    playing: false,
-    pollTimer: null,
-    syncTimer: null
-  };
-
-  function getVideoEl() {
-    return document.querySelector('video');
+  function gvProbes() {
+    if (!window.performance || !performance.getEntriesByType) { log('perf: getEntriesByType absent'); return; }
+    var list = performance.getEntriesByType('resource');
+    if (!list || !list.length) { log('perf: 0 resource entries'); return; }
+    var n = list.length;
+    var gv = [];
+    for (var i = 0; i < n; i++) {
+      var nm = String(list[i].name || '');
+      if (nm.indexOf('googlevideo') !== -1) gv.push(nm);
+    }
+    log('perf: entries=' + n + ' googlevideo=' + gv.length);
+    for (var k = 0; k < gv.length && k < 8; k++) {
+      log('gvurl[' + k + '] itag=' + (qparam(gv[k], 'itag') || qparam(gv[k], 'itags') || '?') +
+          ' mime=' + (qparam(gv[k], 'mime') || '?') + ' len=' + gv[k].length + ' ' + gv[k].slice(0, 80));
+    }
   }
 
-  function getVideoId() {
-    try {
-      var u = new URL(location.href);
-      var v = u.searchParams.get('v');
-      if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+  function qparam(s, key) {
+    var m = new RegExp('[?&]' + key + '=([^&#]*)').exec(s);
+    if (!m) return null;
+    var v = m[1];
+    return v.length > 60 ? v.slice(0, 60) : v;
+  }
 
-      if (u.hostname.indexOf('youtu.be') !== -1) {
-        var shortId = u.pathname.replace(/^\/+/, '').split('/')[0];
-        if (/^[a-zA-Z0-9_-]{11}$/.test(shortId)) return shortId;
-      }
-
-      var pathMatch = u.pathname.match(/\/(shorts|live|watch)\/([a-zA-Z0-9_-]{11})/);
-      if (pathMatch) return pathMatch[2];
-    } catch (e) {}
-
-    var m = location.href.match(/(?:[?&]v=|\/(?:shorts|live)\/)([a-zA-Z0-9_-]{11})/);
+  function videoIdFromHref() {
+    var m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(String(location.href));
     return m ? m[1] : null;
   }
 
-  // ========================================================================
-  // Web Audio playback + sync
-  //
-  // Cobalt's media pipeline rejects a progressive mp3 played through an
-  // <audio> element ("Progressive streams are unsupported" /
-  // IsSupportedMediaMimeType(audio/mpeg) -> false). So instead we decode the
-  // ENTIRE downloaded mp3 into a PCM AudioBuffer via the Web Audio API and
-  // schedule it on an AudioContext -- a completely separate code path that
-  // does NOT go through the "progressive" demuxer. We keep the translation in
-  // sync with the video by (re)starting the buffer at the right offset
-  // whenever it drifts more than SYNC_THRESHOLD seconds.
-  // ========================================================================
-  function ensureCtx() {
-    if (!S.audioCtx) {
-      var Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) throw new Error('no AudioContext');
-      S.audioCtx = new Ctx();
-      S.gainNode = S.audioCtx.createGain();
-      S.gainNode.gain.value = 1.0;
-      S.gainNode.connect(S.audioCtx.destination);
+  function tick() {
+    if (!ytvvLogged && typeof window._yttv !== 'undefined') {
+      yttvLogged = true;
+      log('_yttv present type=' + typeof window._yttv);
     }
-    if (S.audioCtx.state === 'suspended') {
-      try { S.audioCtx.resume(); } catch (e) {}
+    var ks = keyRing.join(',');
+    if (ks && ks !== lastKeyStr) { lastKeyStr = ks; log('keys ' + ks); }
+    var id = videoIdFromHref();
+    if (!id) return;
+    if (!pending[id]) {
+      pending[id] = { t0: Date.now(), probed: false, durWarned: false, noVideoLogged: false, laterLogged: false, gvProbed: false };
+      log('watch detected id=' + id + ' href=' + String(location.href).slice(0, 130));
     }
-    return S.audioCtx;
-  }
-
-  // Where in the translation buffer we currently are (seconds).
-  function currentAudioOffset() {
-    if (!S.audioCtx || !S.playing) return S.startedAtOffset;
-    return S.startedAtOffset + (S.audioCtx.currentTime - S.startedAtCtxTime);
-  }
-
-  function stopSrcNode() {
-    if (S.srcNode) {
-      try { S.srcNode.onended = null; S.srcNode.stop(); } catch (e) {}
-      try { S.srcNode.disconnect(); } catch (e) {}
-      S.srcNode = null;
+    var st = pending[id];
+    var v = findVideo();
+    if (v) onVideoFound(v, id, st);
+    else if (!st.noVideoLogged && Date.now() - st.t0 > 25000) {
+      st.noVideoLogged = true;
+      warn('no usable <video> found for 25s id=' + id);
     }
-    S.playing = false;
   }
 
-  // Start playing the decoded buffer from `offset` seconds.
-  function playFromOffset(offset) {
-    if (!S.audioBuffer) return;
-    stopSrcNode();
-    if (offset < 0) offset = 0;
-    if (offset >= S.audioBuffer.duration) return; // past the end
-    var node = S.audioCtx.createBufferSource();
-    node.buffer = S.audioBuffer;
-    node.connect(S.gainNode);
-    node.start(0, offset);
-    S.srcNode = node;
-    S.startedAtCtxTime = S.audioCtx.currentTime;
-    S.startedAtOffset = offset;
-    S.playing = true;
-  }
-
-  function syncAudio() {
-    var video = getVideoEl();
-    if (!video || !S.audioBuffer || !S.on) return;
-
-    // Mirror the video's play/pause state.
-    if (video.paused) {
-      if (S.playing) {
-        // Freeze: remember where we are and stop the node.
-        S.startedAtOffset = currentAudioOffset();
-        stopSrcNode();
+  function onVideoFound(v, id, st) {
+    if (st.probed) return;
+    var d = Number(v.duration) || 0;
+    if (d <= 0 || !isFinite(d)) {
+      // duration often 0 until metadata arrives; tick re-checks every 2.5 s
+      if (Date.now() - st.t0 > 60000 && !st.durWarned) {
+        st.durWarned = true;
+        warn('duration unavailable after 60s id=' + id + ' readyState=' + v.readyState +
+             ' src=' + String(v.currentSrc || v.src || '').slice(0, 100));
       }
-      video.volume = 0.10;
       return;
     }
-
-    var target = video.currentTime;
-    var drift = Math.abs(currentAudioOffset() - target);
-    if (!S.playing || drift > SYNC_THRESHOLD) {
-      playFromOffset(target);
-    }
-    video.volume = 0.10;
-  }
-
-  // The translated mp3 lives on vtrans.s3-private.mds.yandex.net, which is in
-  // neither the page's CSP connect-src NOR media-src. We fetch it THROUGH the
-  // worker's audio-proxy (connect-src allows the worker), then decode the raw
-  // bytes with Web Audio (bypasses Cobalt's progressive-stream limitation).
-  function attachAudio(url) {
-    var proxied = VOT_WORKER + '/video-translation/audio-proxy?u=' +
-                  encodeURIComponent(url);
-    notify('загрузка озвучки...');
-    fetch(proxied, { method: 'GET' }).then(function(resp) {
-      if (!resp.ok) throw new Error('audio-proxy ' + resp.status);
-      return resp.arrayBuffer();
-    }).then(function(arrayBuf) {
-      if (!S.on) return; // turned off during download
-      var ctx = ensureCtx();
-      notify('декодирование...');
-      LOG('mp3 downloaded, bytes =', arrayBuf.byteLength, '-> WASM decode');
-      // Cobalt's decodeAudioData only handles WAV and throws a DOMException on
-      // mp3, so decode the mp3 ourselves with the mpg123-decoder WASM bundle
-      // and hand the resulting PCM AudioBuffer to onDecoded().
-      return decodeMp3ToAudioBuffer(arrayBuf, ctx).then(function(buf) {
-        if (!S.on) return;
-        onDecoded(buf);
-      });
-    }).catch(function(e) {
-      notify('ошибка аудио: ' + (e && e.message));
-      console.error('[VOT] attachAudio', e);
-    });
-  }
-
-  function onDecoded(buf) {
-    if (!S.on || !buf) return;
-    S.audioBuffer = buf;
-    LOG('audio decoded, duration =', buf.duration.toFixed(1), 's');
-    notify('озвучка запущена');
-    var video = getVideoEl();
-    if (video && !video.paused) {
-      playFromOffset(video.currentTime || 0);
-    } else {
-      S.startedAtOffset = video ? (video.currentTime || 0) : 0;
-    }
-    if (video) video.volume = 0.10;
-    clearInterval(S.syncTimer);
-    S.syncTimer = setInterval(syncAudio, 300);
-  }
-
-  // ========================================================================
-  // Status reporting: prefer the native TizenTube toast (D-pad friendly,
-  // matches the app UI), fall back to the floating overlay status div.
-  // ========================================================================
-  function notify(text) {
-    setOverlayStatus(text);
-    try {
-      var rc = getResolveCommand();
-      if (rc) {
-        rc({
-          openPopupAction: {
-            popupType: 'TOAST',
-            popup: {
-              overlayToastRenderer: {
-                title: { simpleText: 'VOT' },
-                subtitle: { simpleText: text }
-              }
-            }
-          }
-        });
+    st.probed = true;
+    log('video id=' + id + ' duration=' + d.toFixed(1) + ' readyState=' + v.readyState +
+        ' src=' + String(v.currentSrc || v.src || '').slice(0, 110) +
+        ' videoCount=' + document.querySelectorAll('video').length);
+    yandexSession().then(function (sess) { return yandexTranslate(sess, id, d); });
+    workerTranslateProbe(id, d);
+    setTimeout(function () { st.gvProbed = true; gvProbes(); }, 15000);
+    setTimeout(function () {
+      var v2 = findVideo();
+      if (v2 && !st.laterLogged) {
+        st.laterLogged = true;
+        log('video+6s rs=' + v2.readyState +
+            ' t=' + Number(v2.currentTime || 0).toFixed(1) +
+            ' paused=' + v2.paused +
+            ' src=' + String(v2.currentSrc || v2.src || '').slice(0, 120));
       }
-    } catch (e) { /* toast is best-effort */ }
+    }, 6000);
   }
 
-  function setOverlayStatus(text) {
-    var el = document.getElementById('vot-status');
-    if (el) el.textContent = text;
-  }
+  // ---- boot -------------------------------------------------------------------
+  probeUrl('lan /ping', LAN + '/ping');
+  probeUrl('lan /vot.js', LAN + '/vot.js');
+  probeUrl('worker /', WORKER + '/');
+  probeUrl('jsdelivr', 'https://cdn.jsdelivr.net/gh/SergeSmich/v@main/vot.js');
 
-  // ========================================================================
-  // Poll for translation
-  // ========================================================================
-  function pollTranslation(videoUrl, duration) {
-    notify('запрос перевода...');
-    LOG('poll translate url=', videoUrl, 'dur=', duration);
-    requestTranslation(videoUrl, duration).then(function(resp) {
-      if (!S.on) return; // user turned it off while waiting
-      var status = resp[4];
-      var tid = resp[7];
-      var url = resp[1];
-      var remaining = resp[5] || 0;
-      // Mirror the translation status into logcat so it's visible over adb
-      // (TOAST alone doesn't show up there). Statuses: 0=FAILED, 1=FINISHED,
-      // 2=WAITING, 3=LONG_WAITING, 5=PART_CONTENT, 6=AUDIO_REQUESTED.
-      LOG('translate resp: status=', status, 'remaining=', remaining,
-          'hasUrl=', !!url, 'tid=', tid);
-
-      if (status === 1 && url) {
-        notify('перевод готов');
-        attachAudio(url);
-        return;
-      }
-      if (status === 6 && tid) {
-        S.translationId = tid;
-        return requestAudio(tid).then(function(aResp) {
-          if (!S.on) return;
-          LOG('audio resp: hasUrl=', !!aResp[1]);
-          if (aResp[1]) {
-            notify('перевод готов');
-            attachAudio(aResp[1]);
-          } else {
-            setOverlayStatus('ожидание аудио...');
-            S.pollTimer = setTimeout(function() {
-              pollTranslation(videoUrl, duration);
-            }, POLL_INTERVAL_MS);
-          }
-        });
-      }
-      if (tid) S.translationId = tid;
-      notify('ожидание перевода (' + status + '): ' + remaining + 'с');
-      setOverlayStatus('ожидание: ' + remaining + 'с');
-      S.pollTimer = setTimeout(function() {
-        pollTranslation(videoUrl, duration);
-      }, POLL_INTERVAL_MS);
-    }).catch(function(e) {
-      notify('ошибка: ' + e.message);
-      LOG('poll error', e && e.message);
-      console.error('[VOT]', e);
-    });
-  }
-
-  function startVOT() {
-    var vid = getVideoId();
-    if (!vid) { notify('нет видео'); return; }
-    var video = getVideoEl();
-    var duration = video ? (video.duration || 0) : 0;
-    var videoUrl = 'https://www.youtube.com/watch?v=' + vid;
-    S.videoId = vid;
-    pollTranslation(videoUrl, duration);
-  }
-
-  function stopVOT() {
-    clearTimeout(S.pollTimer);
-    clearInterval(S.syncTimer);
-    stopSrcNode();
-    S.audioBuffer = null;
-    S.startedAtOffset = 0;
-    var video = getVideoEl();
-    if (video) video.volume = 1.0;
-    S.videoId = null;
-    S.translationId = null;
-  }
-
-  function toggleVOT() {
-    S.on = !S.on;
-    syncOverlayButton();
-    if (S.on) {
-      notify('Перевод ВКЛ');
-      startVOT();
-    } else {
-      notify('Перевод ВЫКЛ');
-      stopVOT();
-    }
-    return S.on;
-  }
-
-  // ========================================================================
-  // NATIVE MENU INTEGRATION
-  //
-  // TizenTube wraps window._yttv[...].instance.resolveCommand and injects
-  // its own buttons ("Mini Player", "Picture in Picture") into the player's
-  // "playback-settings" popup. Those buttons are real, D-pad-navigable YouTube
-  // TV renderers, and clicking one fires a customAction that TizenTube's own
-  // resolveCommand wrapper routes. We reuse EXACTLY that mechanism.
-  //
-  // IMPORTANT: there are MANY _yttv entries (bundle patches ~12). The active
-  // instance that actually receives the playback-settings popup is not
-  // necessarily the first one, so we must wrap EVERY instance that exposes
-  // resolveCommand (exactly what TizenTube's patchResolveCommand does).
-  // ========================================================================
-
-  function LOG() {
-    try {
-      var a = ['[VOT]'];
-      for (var i = 0; i < arguments.length; i++) a.push(arguments[i]);
-      console.info.apply(console, a);
-    } catch (e) {}
-  }
-
-  function getResolveCommand() {
-    if (!window._yttv) return null;
-    for (var key in window._yttv) {
-      var e = window._yttv[key];
-      if (e && e.instance && typeof e.instance.resolveCommand === 'function') {
-        return e.instance.resolveCommand.bind(e.instance);
-      }
-    }
-    return null;
-  }
-
-  // A YouTube-TV compactLinkRenderer button that toggles VOT.
-  //
-  // IMPORTANT: we use signalAction.signal (NOT customAction). TizenTube's own
-  // resolveCommand wrapper swallows EVERY customAction (it does
-  // `if (cmd.customAction) { ...; return true; }`), so if its wrapper sits
-  // outside ours, our customAction never reaches us. It only touches
-  // signalAction when there's a nested customAction — a plain signal passes
-  // straight through to the inner (our) wrapper regardless of wrapper order.
-  function votButtonItem() {
-    return {
-      compactLinkRenderer: {
-        title: { simpleText: 'Yandex перевод (VOT)' },
-        subtitle: { simpleText: S.on ? 'ВКЛ' : 'ВЫКЛ' },
-        icon: { iconType: 'TRANSLATE' },
-        serviceEndpoint: {
-          commandExecutorCommand: {
-            commands: [
-              { signalAction: { signal: 'VOT_TOGGLE' } },
-              { signalAction: { signal: 'POPUP_BACK' } }
-            ]
-          }
-        }
-      }
-    };
-  }
-
-  // Recursively search a popup object for ANY array named "items" that looks
-  // like a menu list, so we don't depend on the exact renderer nesting path
-  // (which differs between YouTube TV builds).
-  function findItemArrays(obj, depth, out) {
-    if (!obj || typeof obj !== 'object' || depth > 8) return out;
-    if (Array.isArray(obj.items)) out.push(obj);
-    for (var k in obj) {
-      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-      var v = obj[k];
-      if (v && typeof v === 'object') findItemArrays(v, depth + 1, out);
-    }
-    return out;
-  }
-
-  function injectVotIntoPopup(cmd) {
-    var containers = findItemArrays(cmd.openPopupAction.popup, 0, []);
-    if (!containers.length) { LOG('popup has no items[] array'); return false; }
-    // Prefer the largest items array (the main option list of the popup).
-    containers.sort(function(a, b) { return b.items.length - a.items.length; });
-    var list = containers[0];
-
-    for (var i = 0; i < list.items.length; i++) {
-      var it = list.items[i];
-      if (it && it.compactLinkRenderer && it.compactLinkRenderer.title &&
-          it.compactLinkRenderer.title.simpleText &&
-          it.compactLinkRenderer.title.simpleText.indexOf('VOT') !== -1) {
-        it.compactLinkRenderer.subtitle = { simpleText: S.on ? 'ВКЛ' : 'ВЫКЛ' };
-        LOG('VOT item already present, refreshed label');
-        return true;
-      }
-    }
-    list.items.splice(list.items.length, 0, votButtonItem());
-    LOG('injected VOT item into popup, items now =', list.items.length);
-    return true;
-  }
-
-  // Recursively check whether a command (or any nested command inside a
-  // commandExecutorCommand) carries our VOT_TOGGLE marker, in any of the
-  // forms YouTube TV might route it through.
-  function isVotToggle(cmd, depth) {
-    if (!cmd || typeof cmd !== 'object' || depth > 6) return false;
-    if (cmd.signalAction && cmd.signalAction.signal === 'VOT_TOGGLE') return true;
-    if (cmd.customAction && cmd.customAction.action === 'VOT_TOGGLE') return true;
-    if (cmd.signalAction && cmd.signalAction.customAction &&
-        cmd.signalAction.customAction.action === 'VOT_TOGGLE') return true;
-    if (cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands) {
-      var cs = cmd.commandExecutorCommand.commands;
-      for (var i = 0; i < cs.length; i++) {
-        if (isVotToggle(cs[i], depth + 1)) return true;
-      }
-    }
-    return false;
-  }
-
-  function makeWrapped(orig) {
-    var wrapped = function(cmd, arg) {
-      try {
-        if (isVotToggle(cmd, 0)) {
-          LOG('VOT_TOGGLE received -> toggle');
-          toggleVOT();
-          return true;
-        }
-        // Diagnostic: log action-like commands (not plain navigation/popups)
-        // so we can see exactly what a menu click routes through.
-        if (cmd && typeof cmd === 'object' && !cmd.openPopupAction) {
-          if (cmd.signalAction || cmd.customAction || cmd.commandExecutorCommand) {
-            var sig = cmd.signalAction && cmd.signalAction.signal;
-            var act = cmd.customAction && cmd.customAction.action;
-            var nExec = cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands &&
-                        cmd.commandExecutorCommand.commands.length;
-            LOG('cmd keys=', Object.keys(cmd).join(','),
-                '| signal=', sig, '| action=', act, '| execN=', nExec);
-          }
-        }
-        if (cmd && cmd.openPopupAction) {
-          var uid = cmd.openPopupAction.uniqueId;
-          var ptype = cmd.openPopupAction.popupType;
-          // Log every popup so we can identify the real player-settings id
-          // via `adb logcat | grep VOT`.
-          LOG('openPopupAction uniqueId=', uid, 'popupType=', ptype);
-          // Inject into the player settings popup. Match by known id OR by the
-          // MODAL popup type that carries an overlayPanelItemListRenderer.
-          if (uid === 'playback-settings' ||
-              (uid && String(uid).indexOf('settings') !== -1) ||
-              ptype === 'MODAL') {
-            injectVotIntoPopup(cmd);
-          }
-        }
-      } catch (err) {
-        LOG('menu hook error', err && err.message);
-      }
-      return orig.apply(this, arguments);
-    };
-    wrapped.__votWrapped = true;
-    return wrapped;
-  }
-
-  var votHookCount = 0;
-  function installMenuHook() {
-    if (!window._yttv) return false;
-    var newly = 0;
-    for (var key in window._yttv) {
-      var e = window._yttv[key];
-      if (e && e.instance && typeof e.instance.resolveCommand === 'function') {
-        var orig = e.instance.resolveCommand;
-        if (orig.__votWrapped) continue;
-        e.instance.resolveCommand = makeWrapped(orig);
-        newly++;
-      }
-    }
-    if (newly) {
-      votHookCount += newly;
-      LOG('wrapped', newly, 'resolveCommand instance(s); total =', votHookCount);
-    }
-    return votHookCount > 0;
-  }
-
-  // Keep (re)installing: instances can appear/rebuild over time (boot, reload,
-  // SPA nav). We never stop fully — just slow down after it's installed.
-  var hookTries = 0;
-  var hookTimer = setInterval(function() {
-    installMenuHook();
-    hookTries++;
-    if (votHookCount > 0 && hookTries > 40) {
-      // switch to a slower steady-state re-check
-      clearInterval(hookTimer);
-      setInterval(installMenuHook, 4000);
-    }
-    if (hookTries > 600) clearInterval(hookTimer);
-  }, 500);
-
-  // The floating overlay button was removed: the native player-menu item is
-  // the intended control. syncOverlayButton is kept as a no-op so callers
-  // (toggleVOT) don't need to change.
-  function syncOverlayButton() { /* no overlay */ }
-
-  // ========================================================================
-  // GUARANTEED remote control: the YELLOW colour button (keyCode 405) is NOT
-  // used by TizenTube (403=red, 404=green are), so we bind it to toggle VOT.
-  // This works everywhere, independent of the player menu structure.
-  //
-  // Debounced: a single physical press emits several keydown/keyup/repeat
-  // events; we act on keydown only and ignore anything within 800ms so one
-  // press = one toggle.
-  // ========================================================================
-  var lastToggleAt = 0;
-  function onKey(evt) {
-    if (evt.keyCode === 405) { // YELLOW
-      evt.preventDefault();
-      evt.stopPropagation();
-      if (evt.type === 'keydown') {
-        var now = Date.now();
-        if (now - lastToggleAt < 800) return false; // debounce repeats
-        lastToggleAt = now;
-        LOG('YELLOW key -> toggle VOT');
-        toggleVOT();
-      }
-      return false;
-    }
-    return true;
-  }
-  document.addEventListener('keydown', onKey, true);
-  document.addEventListener('keyup', onKey, true);
-
-  // ========================================================================
-  // Watch for URL changes (video switch)
-  // ========================================================================
-  var lastUrl = location.href;
-  setInterval(function() {
-    if (location.href === lastUrl) return;
-    lastUrl = location.href;
-
-    // Re-arm the menu hook in case the client rebuilt _yttv during nav.
-    installMenuHook();
-
-    if (S.on) {
-      stopVOT();
-      setTimeout(function() { if (S.on) startVOT(); }, 1500);
-    }
-  }, 1500);
-
+  setInterval(tick, 2500);
+  tick();
 })();
