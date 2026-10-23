@@ -29,7 +29,7 @@
   //      so device-support patches (UA/brand/arch) stay alive.
   // ======================================================================
 
-  var MARK = 'VOTDIAG-2026-10-23-b1';
+  var MARK = 'VOTDIAG-2026-10-23-b2';
   var ORIG_URL =
     'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
     Date.now() + '.' + Math.floor(Math.random() * 1e6);
@@ -357,7 +357,7 @@
   }
 
   function tick() {
-    if (!ytvvLogged && typeof window._yttv !== 'undefined') {
+    if (!yttvLogged && typeof window._yttv !== 'undefined') {
       yttvLogged = true;
       log('_yttv present type=' + typeof window._yttv);
     }
@@ -414,6 +414,28 @@
   probeUrl('lan /vot.js', LAN + '/vot.js');
   probeUrl('worker /', WORKER + '/');
   probeUrl('jsdelivr', 'https://cdn.jsdelivr.net/gh/SergeSmich/v@main/vot.js');
+  probeUrl('localhost:8012 apps', 'http://localhost:8012/apps/YouTube');
+
+  // ---- Java bridge discovery ---------------------------------------------------
+  (function () {
+    log('typeof window.cobalt=' + typeof window.cobalt + ' typeof window.h5vcc=' + typeof window.h5vcc);
+    if (window.cobalt) {
+      var ck = [];
+      for (var k in window.cobalt) {
+        if (window.cobalt.hasOwnProperty(k)) ck.push(k + ':' + typeof window.cobalt[k]);
+      }
+      log('cobalt keys ' + j(ck.slice(0, 40)));
+    }
+    try {
+      var br = [];
+      for (var g in window) {
+        if (typeof g === 'string' && g.length < 40 && /cobalt|h5vcc|bridge|starboard|tizentube/i.test(g)) {
+          br.push(g + ':' + typeof window[g]);
+        }
+      }
+      log('bridge candidates ' + j(br.slice(0, 30)));
+    } catch (e4) { warn('bridge scan: ' + e4); }
+  })();
 
   setInterval(tick, 2500);
   tick();
